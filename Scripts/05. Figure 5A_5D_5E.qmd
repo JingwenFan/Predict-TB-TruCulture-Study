@@ -1,0 +1,533 @@
+---
+title: "Figures 5A, 5C, and 5D"
+subtitle: "Linear mixed-effects models of demographic and clinical factors and treatment effect on PET/CT volumes"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Linear mixed-effects models are used to test whether Age, W0_BMI, and W0_MGIT (Mtb burden)
+are associated with PET/CT volumes at W0, W4, W16, and W24, and whether
+these associations differ between visits. Each predictor is tested
+independently against each outcome. A threshold of p < 0.05 is
+used to identify significant effects. 
+
+Figure 5A: Age and treatment effect on total cavity volume (CAVTOT, mL) and
+total lesion glycolysis (TLG, mL).
+
+Figure 5D: W0_BMI and treatment effect on total cavity volume (CAVTOT, mL) and
+total lesion glycolysis (TLG, mL).
+
+Figure 5E: W0_MGIT Mtb burden and treatment effect on total cavity volume
+(CAVTOT, mL) and total lesion glycolysis (TLG, mL).
+
+For each predictor and outcome a model of the form
+`outcome ~ Visit * Predictor + covariates + (1|ID1)` is fitted. Age is
+adjusted for Sex and trial Arm only. BMI and MGIT are adjusted for Age, Sex,
+and trial Arm. The interaction term tests whether the association between the
+predictor and imaging volume differs between visits. Demographics are
+patient-level variables so the analysis uses one record per patient from the
+Null condition.
+
+# Load packages
+
+```{r}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(DataExplorer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(car)
+library(emmeans)
+library(writexl)
+```
+
+# Define file paths
+
+```{r}
+input_file  <- "Input/Demographic and clinical information.xlsx"
+input_pet   <- "Input/PET.CT_long_SATVI.xlsx"
+output_main <- "Output/05. Figure_5A_5D_5E"
+
+dir.create(output_main, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1) %>%
+  filter(Comments == "success") %>%
+  mutate(Previous_TB = ifelse(Previous_TB == "0 episode", "No", "Yes"))
+
+head(all_data)
+dim(all_data)
+
+pet_data <- read_excel(input_pet, sheet = 1) %>%
+  filter(Comments == "success") %>%
+  select(ID1, Visit, CAVTOT, TLG) %>%
+  mutate(Visit = paste0("W", Visit))
+
+head(pet_data)
+dim(pet_data)
+```
+
+# Filter and recode
+
+Demographics are extracted from the Null condition to obtain one unique record
+per patient. Because demographics do not change between visits, the join is by
+ID1 only and the PET/CT data contributes the visit structure.
+
+```{r}
+demo_data <- all_data %>%
+  mutate(
+    Age         = as.numeric(Age),
+    BMI_0         = as.numeric(BMI_0),
+    MGIT_0        = as.numeric(MGIT_0),
+    Previous_TB = factor(Previous_TB, levels = c("No", "Yes")),
+    Sex         = factor(Sex,         levels = c("Female", "Male")),
+    Arm         = factor(Arm,         levels = c("A", "B", "C"))
+  ) %>%
+  select(ID1, Age, Sex, Arm, BMI_0, MGIT_0) %>%
+  distinct()
+
+cat(sprintf("Patients with demographic data: %d\n", nrow(demo_data)))
+cat(sprintf(
+  "Age range: %.0f - %.0f | Sex: %s | Arm: %s\n",
+  min(demo_data$Age, na.rm = TRUE),
+  max(demo_data$Age, na.rm = TRUE),
+  paste(levels(demo_data$Sex), collapse = ", "),
+  paste(levels(demo_data$Arm), collapse = ", ")
+))
+```
+
+# Merge demographics and PET/CT data
+
+```{r}
+analysis_data <- pet_data %>%
+  left_join(demo_data, by = "ID1") %>%
+  filter(!is.na(TLG))
+
+cat(sprintf("Merged rows: %d | Samples with CAVTOT: %d | TLG: %d\n",
+            nrow(analysis_data),
+            sum(!is.na(analysis_data$CAVTOT)),
+            sum(!is.na(analysis_data$TLG))))
+```
+
+# Log transform imaging variables
+
+CAVTOT and TLG are log10(1 + x) transformed to handle zero values safely.
+
+```{r}
+analysis_data <- analysis_data %>%
+  mutate(
+    CAVTOT = log10(1 + CAVTOT),
+    TLG    = log10(1 + TLG)
+  )
+```
+
+# Data overview
+
+```{r}
+plot_intro(analysis_data)
+```
+
+# Analysis configuration
+
+`predictor_config` defines each variable, its covariates, x-axis unit, figure
+label, and the exact caption formula displayed in each plot. `outcome_config`
+defines the two imaging outcomes.
+
+```{r}
+predictor_config <- list(
+
+  Age = list(
+    variable        = "Age",
+    label           = "Age",
+    covariates      = c("Sex", "Arm"),
+    unit            = "years",
+    caption_formula = "LME: outcome ~ Visit * Age + Sex + Arm + (1|ID1)"
+  ),
+
+  BMI_0 = list(
+    variable        = "BMI_0",
+    label           = "W0 BMI",
+    covariates      = c("Age", "Sex", "Arm"),
+    unit            = "kg/m2",
+    caption_formula = "LME: outcome ~ Visit * BMI_0 + Age + Sex + Arm + (1|ID1)"
+  ),
+
+  MGIT_0 = list(
+    variable        = "MGIT_0",
+    label           = "W0 MGIT Mtb burden",
+    covariates      = c("Age", "Sex", "Arm"),
+    unit            = "",
+    caption_formula = "LME: outcome ~ Visit * MGIT_0 + Age + Sex + Arm + (1|ID1)"
+  )
+)
+
+outcome_config <- list(
+
+  CAVTOT = list(
+    outcome      = "CAVTOT",
+    label        = "Total cavity volume (log10 mL)",
+    min_obs      = 10,
+    min_subjects = 5
+  ),
+
+  TLG = list(
+    outcome      = "TLG",
+    label        = "Total lesion glycolysis (log10 mL)",
+    min_obs      = 10,
+    min_subjects = 5
+  )
+)
+
+cat("predictor_config entries:", paste(names(predictor_config), collapse = ", "), "\n")
+cat("outcome_config entries:",   paste(names(outcome_config),   collapse = ", "), "\n")
+```
+
+# Visit colours
+
+```{r}
+visit_colors <- c("W0" = "#000000", "W4" = "orange", "W16" = "#00CCFF", "W24" = "purple")
+```
+
+# LME screening function
+
+`screen_lme`: fits `outcome ~ Visit * Predictor_Value + covariates + (1|ID1)`
+for one predictor and one outcome. Returns Wald chi-square p-values for the
+Visit main effect, predictor main effect, and interaction. Returns NULL if
+data are insufficient.
+
+```{r}
+screen_lme <- function(data, predictor_name, outcome,
+                       covariates   = NULL,
+                       min_obs      = 10,
+                       min_subjects = 5) {
+
+  keep_cols <- unique(c("ID1", "Visit", outcome, predictor_name, covariates))
+
+  dat <- data %>%
+    select(all_of(keep_cols)) %>%
+    filter(!is.na(.data[[outcome]]),
+           !is.na(.data[[predictor_name]])) %>%
+    rename(Predictor_Value = all_of(predictor_name)) %>%
+    mutate(
+      Predictor_Value = if (is.factor(Predictor_Value)) {
+                          as.numeric(Predictor_Value) - 1
+                        } else {
+                          as.numeric(Predictor_Value)
+                        },
+      ID1   = as.factor(ID1),
+      Visit = factor(Visit, levels = c("W0", "W4", "W16", "W24"))
+    )
+
+  if (nrow(dat) < min_obs || n_distinct(dat$ID1) < min_subjects) return(NULL)
+
+  covariate_terms <- if (!is.null(covariates)) paste(covariates, collapse = " + ") else NULL
+  formula_str     <- paste(
+    outcome, "~ Visit * Predictor_Value",
+    if (!is.null(covariate_terms)) paste("+", covariate_terms),
+    "+ (1|ID1)"
+  )
+
+  tryCatch({
+    model     <- lmer(as.formula(formula_str), data = dat, REML = FALSE)
+    anova_res <- Anova(model, type = 3)
+
+    data.frame(
+      Predictor     = predictor_name,
+      Visit_p       = anova_res["Visit",                 "Pr(>Chisq)"],
+      Predictor_p   = anova_res["Predictor_Value",       "Pr(>Chisq)"],
+      Interaction_p = anova_res["Visit:Predictor_Value", "Pr(>Chisq)"],
+      N_obs         = nrow(dat),
+      N_subjects    = n_distinct(dat$ID1),
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) {
+    message("LME failed for ", predictor_name, ": ", e$message)
+    NULL
+  })
+}
+```
+
+# P-value formatting helper
+
+```{r}
+format_p <- function(p) {
+  stars <- if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else ""
+  label <- if (p < 0.001) "p < 0.001" else sprintf("p = %.3f", p)
+  paste0(label, stars)
+}
+```
+
+# LME plot function
+
+`plot_lme`: fits the same model as `screen_lme` and generates a scatter plot
+with LME-predicted regression lines per visit and 95% confidence bands from
+emmeans. Raw p-values with significance stars are shown in the subtitle.
+Regression equations are annotated in the top right corner. The caption
+formula is taken from `predictor_config` and displayed exactly as specified.
+
+```{r}
+plot_lme <- function(data, predictor_name, predictor_label, predictor_unit,
+                     outcome, outcome_label, caption_formula,
+                     visit_colors, covariates = NULL, save_path = NULL) {
+
+  keep_cols <- unique(c("ID1", "Visit", outcome, predictor_name, covariates))
+
+  dat <- data %>%
+    select(all_of(keep_cols)) %>%
+    filter(!is.na(.data[[outcome]]),
+           !is.na(.data[[predictor_name]])) %>%
+    rename(Predictor_Value = all_of(predictor_name)) %>%
+    mutate(
+      Predictor_Value = if (is.factor(Predictor_Value)) {
+                          as.numeric(Predictor_Value) - 1
+                        } else {
+                          as.numeric(Predictor_Value)
+                        },
+      ID1   = as.factor(ID1),
+      Visit = factor(Visit, levels = c("W0", "W4", "W16", "W24"))
+    )
+
+  if (nrow(dat) < 10 || n_distinct(dat$ID1) < 5) return(invisible(NULL))
+
+  covariate_terms <- if (!is.null(covariates)) paste(covariates, collapse = " + ") else NULL
+  formula_str     <- paste(
+    outcome, "~ Visit * Predictor_Value",
+    if (!is.null(covariate_terms)) paste("+", covariate_terms),
+    "+ (1|ID1)"
+  )
+
+  model <- tryCatch(
+    lmer(as.formula(formula_str), data = dat, REML = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) return(invisible(NULL))
+
+  anova_res     <- Anova(model, type = 3)
+  visit_p       <- anova_res["Visit",                 "Pr(>Chisq)"]
+  predictor_p   <- anova_res["Predictor_Value",       "Pr(>Chisq)"]
+  interaction_p <- anova_res["Visit:Predictor_Value", "Pr(>Chisq)"]
+
+  pred_seq <- seq(
+    min(dat$Predictor_Value, na.rm = TRUE),
+    max(dat$Predictor_Value, na.rm = TRUE),
+    length.out = 50
+  )
+
+  pred <- as.data.frame(
+    emmeans(model, ~ Visit * Predictor_Value,
+            at = list(Predictor_Value = pred_seq))
+  )
+
+  coefs         <- fixef(model)
+  intercept_w0  <- coefs["(Intercept)"]
+  slope_w0      <- coefs["Predictor_Value"]
+
+  intercept_w4  <- intercept_w0 +
+    ifelse("VisitW4" %in% names(coefs), coefs["VisitW4"], 0)
+  slope_w4      <- slope_w0 +
+    ifelse("VisitW4:Predictor_Value" %in% names(coefs),
+           coefs["VisitW4:Predictor_Value"], 0)
+
+  intercept_w16 <- intercept_w0 +
+    ifelse("VisitW16" %in% names(coefs), coefs["VisitW16"], 0)
+  slope_w16     <- slope_w0 +
+    ifelse("VisitW16:Predictor_Value" %in% names(coefs),
+           coefs["VisitW16:Predictor_Value"], 0)
+
+  intercept_w24 <- intercept_w0 +
+    ifelse("VisitW24" %in% names(coefs), coefs["VisitW24"], 0)
+  slope_w24     <- slope_w0 +
+    ifelse("VisitW24:Predictor_Value" %in% names(coefs),
+           coefs["VisitW24:Predictor_Value"], 0)
+
+  visits_present <- levels(droplevels(dat$Visit))
+
+  eq_lines <- c()
+  if ("W0"  %in% visits_present)
+    eq_lines <- c(eq_lines, sprintf("W0:  y = %.3fx %s %.3f",
+      slope_w0,  ifelse(intercept_w0  >= 0, "+", "-"), abs(intercept_w0)))
+  if ("W4"  %in% visits_present)
+    eq_lines <- c(eq_lines, sprintf("W4:  y = %.3fx %s %.3f",
+      slope_w4,  ifelse(intercept_w4  >= 0, "+", "-"), abs(intercept_w4)))
+  if ("W16" %in% visits_present)
+    eq_lines <- c(eq_lines, sprintf("W16: y = %.3fx %s %.3f",
+      slope_w16, ifelse(intercept_w16 >= 0, "+", "-"), abs(intercept_w16)))
+  if ("W24" %in% visits_present)
+    eq_lines <- c(eq_lines, sprintf("W24: y = %.3fx %s %.3f",
+      slope_w24, ifelse(intercept_w24 >= 0, "+", "-"), abs(intercept_w24)))
+
+  eq_label <- paste(eq_lines, collapse = "\n")
+
+  p <- ggplot() +
+    geom_ribbon(
+      data = pred,
+      aes(x = Predictor_Value, ymin = lower.CL, ymax = upper.CL, fill = Visit),
+      alpha = 0.2
+    ) +
+    geom_line(
+      data = pred,
+      aes(x = Predictor_Value, y = emmean, color = Visit),
+      linewidth = 1.5
+    ) +
+    geom_point(
+      data = dat,
+      aes(x = Predictor_Value, y = .data[[outcome]], color = Visit),
+      alpha = 0.6, size = 2.5
+    ) +
+    annotate(
+      "text",
+      x = Inf, y = Inf, label = eq_label,
+      hjust = 1.05, vjust = 1.5, size = 4.2,
+      fontface = "italic", color = "black"
+    ) +
+    scale_color_manual(values = visit_colors, name = "Visit") +
+    scale_fill_manual(values  = visit_colors, name = "Visit") +
+    labs(
+      title    = predictor_label,
+      subtitle = paste0(
+        "Visit: ",       format_p(visit_p),     "  |  ",
+        "Predictor: ",   format_p(predictor_p), "  |  ",
+        "Interaction: ", format_p(interaction_p)
+      ),
+      x       = paste0(predictor_label, " (", predictor_unit, ")"),
+      y       = outcome_label,
+      caption = caption_formula
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "top",
+      plot.title      = element_text(face = "bold"),
+      plot.subtitle   = element_text(size = 12, color = "black"),
+      panel.grid.major    = element_line(color = "grey85", linewidth = 0.4),
+      panel.grid.minor    = element_line(color = "grey92", linewidth = 0.2)
+    )
+
+  print(p)
+
+  if (!is.null(save_path)) {
+    ggsave(
+      file.path(save_path,
+                paste0(predictor_name, "_LME_", outcome, ".pdf")),
+      plot = p, width = 8, height = 6, units = "in"
+    )
+  }
+
+  invisible(p)
+}
+```
+
+# Run all analyses
+
+For each outcome, each predictor is tested independently.
+
+```{r}
+all_analyses <- list()
+
+for (outcome_name in names(outcome_config)) {
+  out_cfg <- outcome_config[[outcome_name]]
+  out_dir <- file.path(output_main, outcome_name)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  cat(sprintf("\nOutcome: %s\n", out_cfg$label))
+
+  screening_results <- bind_rows(lapply(names(predictor_config), function(pred_name) {
+    pred_cfg <- predictor_config[[pred_name]]
+    screen_lme(
+      data           = analysis_data,
+      predictor_name = pred_cfg$variable,
+      outcome        = out_cfg$outcome,
+      covariates     = pred_cfg$covariates,
+      min_obs        = out_cfg$min_obs,
+      min_subjects   = out_cfg$min_subjects
+    )
+  }))
+
+  if (nrow(screening_results) == 0) {
+    cat(sprintf("  No results for %s. Skipping.\n", outcome_name))
+    next
+  }
+
+  cat(sprintf("  Predictors screened: %d\n", nrow(screening_results)))
+
+  screening_results <- screening_results %>%
+    mutate(
+      Visit_sig       = Visit_p       < 0.05,
+      Predictor_sig   = Predictor_p   < 0.05,
+      Interaction_sig = Interaction_p < 0.05,
+      Any_sig         = Visit_sig | Predictor_sig | Interaction_sig
+    ) %>%
+    arrange(Interaction_p)
+
+  cat(sprintf(
+    "  Significant (p < 0.05): Visit = %d | Predictor = %d | Interaction = %d\n",
+    sum(screening_results$Visit_sig,       na.rm = TRUE),
+    sum(screening_results$Predictor_sig,   na.rm = TRUE),
+    sum(screening_results$Interaction_sig, na.rm = TRUE)
+  ))
+
+  write_xlsx(screening_results, file.path(out_dir, "LME_screening_results.xlsx"))
+
+  for (pred_name in names(predictor_config)) {
+  pred_cfg <- predictor_config[[pred_name]]
+
+  plot_lme(
+    data            = analysis_data,
+    predictor_name  = pred_cfg$variable,
+    predictor_label = pred_cfg$label,
+    predictor_unit  = pred_cfg$unit,
+    outcome         = out_cfg$outcome,
+    outcome_label   = out_cfg$label,
+    caption_formula = pred_cfg$caption_formula,
+    visit_colors    = visit_colors,
+    covariates      = pred_cfg$covariates,
+    save_path       = out_dir                            
+  )
+}
+
+  summary_table <- screening_results %>%
+    select(
+      Predictor, N_obs, N_subjects,
+      Visit_p, Visit_sig,
+      Predictor_p, Predictor_sig,
+      Interaction_p, Interaction_sig, Any_sig
+    )
+
+  write_xlsx(summary_table, file.path(out_dir, "LME_summary_table.xlsx"))
+
+  all_analyses[[outcome_name]] <- list(
+  screening_results  = screening_results,
+  predictors_plotted = names(predictor_config)           
+)
+}
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```

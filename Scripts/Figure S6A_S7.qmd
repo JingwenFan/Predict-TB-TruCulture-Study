@@ -1,0 +1,405 @@
+---
+title: "Figures S6A and S7"
+subtitle: "LOESS regression for cytokine response kinetics in different treatment outcome groups"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Figure S6A: LOESS regression for cytokine response kinetics in the Null
+condition in successfully treated patients who received 24-week
+treatment (Arms A and B).
+
+Figure S7A: LOESS regression comparing cytokine response kinetics across all
+stimulation conditions (Null, Mtb_Ag, LPS, IL1B) in patients with similar
+baseline lung disease (Arms B and C) from the treatment success group (n = 18)
+and treatment failure group (n = 2). 
+
+Figure S7B: LOESS regression comparing cytokine response kinetics across all
+stimulation conditions (Null, Mtb_Ag, LPS, IL1B) in patients with similar
+baseline lung disease (Arms B and C) from the treatment success group (n = 18) and
+confirmed relapse group (n = 4).
+
+# Load packages
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+# Define file paths
+
+```{r}
+#| label: file-paths
+
+input_file <- "Input/Cytokines_cleaned_log10_Predict-TB.xlsx"
+
+output_main   <- "Output/Figure_S6A_S7"
+output_null   <- "Output/Figure_S6A_S7/S6A_Null"
+output_s7a    <- "Output/Figure_S6A_S7/S7A_SuccVsFail"
+output_s7b    <- "Output/Figure_S6A_S7/S7B_SuccVsRelapse"
+
+for (d in c(output_main, output_null, output_s7a, output_s7b)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# Load data
+
+```{r}
+#| label: load-data
+
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Filter and recode
+
+```{r}
+#| label: filter-recode
+
+protein_data <- all_data %>%
+  filter(Comments %in% c("success", "treatment failure", "confirmed relapse")) %>%
+  mutate(
+    Visit     = as.numeric(Visit),
+    Condition = ifelse(Condition == "TB", "Mtb_Ag", Condition),
+    Condition = factor(Condition, levels = c("Null", "Mtb_Ag", "LPS", "IL1B")),
+    Comments  = factor(Comments,
+                       levels = c("success", "treatment failure", "confirmed relapse")),
+    Arm       = factor(Arm, levels = c("A", "B", "C"))
+  )
+
+cat("Visits present:     ", paste(sort(unique(protein_data$Visit)),    collapse = ", "), "\n")
+cat("Conditions present: ", paste(levels(protein_data$Condition),      collapse = ", "), "\n")
+cat("Outcomes present:   ", paste(levels(protein_data$Comments),       collapse = ", "), "\n")
+cat("Arms present:       ", paste(levels(protein_data$Arm),            collapse = ", "), "\n")
+```
+
+# Define cytokine columns
+
+```{r}
+#| label: define-cytokines
+
+cytokine_cols <- c(
+  "BDNF", "CCL11", "Factor_VII", "ICAM_1",
+  "IL_1_alpha", "IL_1_beta", "IL_10", "IL_12p40",
+  "IL_12p70", "IL_18", "IL_1RA", "IL_3", "IL_4",
+  "IL_6", "IL_7", "IL_8", "CCL2", "CCL3",
+  "MMP_3", "TNF", "VEGF", "IFNG", "IL_2",
+  "pan_IFNA", "IFNB"
+)
+
+cat(sprintf("Cytokines: %d\n", length(cytokine_cols)))
+```
+
+# Null subtraction across all stimulation conditions
+
+```{r}
+#| label: subtract-null-function
+
+subtract_null_all <- function(df, cytokine) {
+
+  base <- df %>%
+    select(ID1, Visit, Condition, Comments, Arm, all_of(cytokine)) %>%
+    rename(log10_Value = all_of(cytokine)) %>%
+    mutate(
+      log10_Value = as.numeric(log10_Value),
+      raw_Value   = 10^log10_Value          # back-transform to raw concentration
+    )
+
+  # Null raw reference per ID1 x Visit
+  ref <- base %>%
+    filter(Condition == "Null") %>%
+    select(ID1, Visit, raw_Null = raw_Value)
+
+  # Null panel — retain original log10 values as the reference panel
+  null_data <- base %>%
+    filter(Condition == "Null") %>%
+    mutate(
+      raw_Null   = raw_Value,
+      Subtracted = NA_real_,
+      log10_Sub  = log10_Value
+    )
+
+  # Stimulated conditions — back-transform, subtract Null, re-transform
+  stim_data <- base %>%
+    filter(Condition != "Null") %>%
+    left_join(ref, by = c("ID1", "Visit")) %>%
+    mutate(
+      Subtracted = pmax(0, raw_Value - raw_Null),
+      log10_Sub  = log10(1 + Subtracted)
+    )
+
+  bind_rows(null_data, stim_data) %>%
+    mutate(Condition = factor(Condition, levels = c("Null", "Mtb_Ag", "LPS", "IL1B")))
+}
+```
+
+# Figure S6A — Null LOESS kinetics in success group (Arms A and B)
+
+```{r}
+#| label: plot-s6a-function
+
+plot_s6a <- function(df, cytokine, save_dir) {
+
+  dat <- df %>%
+    filter(
+      Arm       %in% c("A", "B"),
+      Comments  == "success",
+      Condition == "Null"
+    ) %>%
+    select(ID1, Visit, all_of(cytokine)) %>%
+    rename(Value = all_of(cytokine)) %>%
+    mutate(Value = as.numeric(Value)) %>%
+    drop_na(Value)
+
+  if (nrow(dat) < 5) {
+    message(sprintf("S6A — %s: too few rows (%d), skipping.", cytokine, nrow(dat)))
+    return(invisible(NULL))
+  }
+
+  p <- ggplot(dat, aes(x = Visit, y = Value)) +
+    geom_jitter(
+      width = 0.9, height = 0,
+      size  = 0.7, alpha  = 0.9,
+      color = "black"
+    ) +
+    geom_smooth(
+      method    = "loess",
+      se        = TRUE,
+      color     = "red",
+      fill      = "#999999",
+      linewidth = 1.2,
+      alpha     = 0.3
+    ) +
+    scale_x_continuous(breaks = c(0, 4, 16, 24)) +
+    labs(
+      title    = paste0(cytokine, " | Null | Arms A/B | Success"),
+      subtitle = "LOESS with 95% CI",
+      x        = "Visit (week)",
+      y        = "Concentration (log10 pg/mL)"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      panel.border     = element_rect(color = "black", fill = NA),
+      plot.background  = element_rect(fill = "white"),
+      axis.text        = element_text(color = "black"),
+      axis.title       = element_text(color = "black")
+    )
+
+  print(p)
+
+  ggsave(
+    file.path(save_dir, paste0("S6A_", cytokine, "_Null_ArmAB_Success.png")),
+    plot = p, width = 4, height = 5, dpi = 300
+  )
+
+  invisible(p)
+}
+```
+
+```{r}
+#| label: run-s6a
+#| message: false
+#| warning: false
+#| fig-width: 4
+#| fig-height: 5
+
+for (cyt in cytokine_cols) {
+  plot_s6a(protein_data, cyt, save_dir = output_null)
+}
+```
+
+# Figure S7A — All conditions: success vs treatment failure (Arms B and C)
+
+```{r}
+#| label: plot-s7a-function
+
+plot_s7a <- function(df, cytokine, save_dir) {
+
+  dat <- df %>%
+    filter(
+      Arm      %in% c("B", "C"),
+      Comments %in% c("success", "treatment failure")
+    ) %>%
+    subtract_null_all(cytokine) %>%
+    drop_na(log10_Sub)
+
+  if (nrow(dat) < 5) {
+    message(sprintf("S7A — %s: too few rows (%d), skipping.", cytokine, nrow(dat)))
+    return(invisible(NULL))
+  }
+
+  outcome_colors <- c("success" = "#339900", "treatment failure" = "magenta")
+
+  set.seed(123)
+  p <- ggplot(dat, aes(x = Visit, y = log10_Sub,
+                        color = Comments, fill = Comments)) +
+    geom_jitter(
+      width = 0.9, height = 0,
+      size  = 0.8, alpha  = 0.9
+    ) +
+    geom_smooth(
+      method      = "loess",
+      se          = TRUE,
+      linewidth   = 1.2,
+      alpha       = 0.2,
+      show.legend = TRUE
+    ) +
+    facet_wrap(~ Condition, ncol = 4) +
+    scale_color_manual(values = outcome_colors, name = "Outcome") +
+    scale_fill_manual(values  = outcome_colors, name = "Outcome") +
+    scale_x_continuous(breaks = c(0, 4, 16, 24)) +
+    labs(
+      title    = paste0(cytokine, " | Arms B/C | Success vs Treatment Failure"),
+      subtitle = "LOESS with 95% CI",
+      x        = "Visit (week)",
+      y        = "Concentration (log10 pg/mL)"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      panel.border     = element_rect(color = "black", fill = NA),
+      plot.background  = element_rect(fill = "white"),
+      axis.text        = element_text(color = "black"),
+      axis.title       = element_text(color = "black"),
+      legend.position  = "right"
+    )
+
+  print(p)
+
+  ggsave(
+    file.path(save_dir,
+              paste0("S7A_", cytokine, "_AllConditions_SuccVsFail.png")),
+    plot = p, width = 10, height = 5, dpi = 300
+  )
+
+  invisible(p)
+}
+```
+
+```{r}
+#| label: run-s7a
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 5
+
+for (cyt in cytokine_cols) {
+  plot_s7a(protein_data, cyt, save_dir = output_s7a)
+}
+```
+
+# Figure S7B — All conditions: success vs confirmed relapse (Arms B and C)
+
+```{r}
+#| label: plot-s7b-function
+
+plot_s7b <- function(df, cytokine, save_dir) {
+
+  dat <- df %>%
+    filter(
+      Arm      %in% c("B", "C"),
+      Comments %in% c("success", "confirmed relapse")
+    ) %>%
+    subtract_null_all(cytokine) %>%
+    drop_na(log10_Sub)
+
+  if (nrow(dat) < 5) {
+    message(sprintf("S7B — %s: too few rows (%d), skipping.", cytokine, nrow(dat)))
+    return(invisible(NULL))
+  }
+
+  outcome_colors <- c("success" = "#339900", "confirmed relapse" = "blue")
+
+  set.seed(123)
+  p <- ggplot(dat, aes(x = Visit, y = log10_Sub,
+                        color = Comments, fill = Comments)) +
+    geom_jitter(
+      width = 0.9, height = 0,
+      size  = 0.8, alpha  = 0.9
+    ) +
+    geom_smooth(
+      method      = "loess",
+      se          = TRUE,
+      level       = 0.95,
+      linewidth   = 1.2,
+      alpha       = 0.2,
+      show.legend = TRUE
+    ) +
+    facet_wrap(~ Condition, ncol = 4) +
+    scale_color_manual(values = outcome_colors, name = "Outcome") +
+    scale_fill_manual(values  = outcome_colors, name = "Outcome") +
+    scale_x_continuous(breaks = c(0, 4, 16, 24)) +
+    labs(
+      title    = paste0(cytokine, " | Arms B/C | Success vs Confirmed Relapse"),
+      subtitle = "LOESS with 95% CI",
+      x        = "Visit (week)",
+      y        = "Concentration (log10 pg/mL)"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white"),
+      panel.border     = element_rect(color = "black", fill = NA),
+      plot.background  = element_rect(fill = "white"),
+      axis.text        = element_text(color = "black"),
+      axis.title       = element_text(color = "black"),
+      legend.position  = "right"
+    )
+
+  print(p)
+
+  ggsave(
+    file.path(save_dir,
+              paste0("S7B_", cytokine, "_AllConditions_SuccVsRelapse.png")),
+    plot = p, width = 10, height = 5, dpi = 300
+  )
+
+  invisible(p)
+}
+```
+
+```{r}
+#| label: run-s7b
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 5
+
+for (cyt in cytokine_cols) {
+  plot_s7b(protein_data, cyt, save_dir = output_s7b)
+}
+```
+
+# Session information
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

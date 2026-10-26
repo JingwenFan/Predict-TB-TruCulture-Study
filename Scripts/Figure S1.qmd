@@ -1,0 +1,541 @@
+---
+title: "Figure S1"
+subtitle: "Repeatability and reproducibility testing of TruCulture biomarker-based classification for TB diagnosis"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Figure S1B: Consistency of response in repeatability and reproducibility tests
+for TruCulture biomarkers to distinguish between asymptomatic controls and
+active TB patients. Classification formula: overall consistency =
+absolute(percentage positive - 0.5) / 0.5. Donors 10001 to 10042 were
+recruited from SATVI in Worcester, South Africa. Donors P1 to P4 were
+recruited from Cochin Hospital in Paris, France.
+
+# Load packages
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(writexl)
+```
+
+# Define file paths
+
+```{r}
+#| label: file-paths
+
+input_file  <- "Input/Repeatability_reproducibility_SATVI_Cochin.xlsx"
+output_main <- "Output/Figure_S1"
+output_cons <- file.path(output_main, "Consistency")
+
+for (d in c(output_main, output_cons)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# Load data
+
+```{r}
+#| label: load-data
+
+all_data <- read_excel(input_file, sheet = 1) %>%
+  mutate(
+    IFN_gamma_Simoa = as.numeric(IFN_gamma_Simoa)
+  )
+
+head(all_data)
+dim(all_data)
+cat("Columns:", paste(names(all_data), collapse = ", "), "\n")
+```
+
+# Define patient groups and working dataset
+
+```{r}
+#| label: define-groups
+
+active_tb_patients <- c("P1", "P2", "P3", "P4", "10042")
+
+control_patients <- c(
+  "10001", "10006", "10007", "10009", "10014",
+  "10037", "10038", "10039", "10043"
+)
+
+df_tb_qc <- all_data
+
+cat("Patient IDs present:", paste(sort(unique(df_tb_qc$PatientId)), collapse = ", "), "\n")
+cat("Visit IDs present  :", paste(sort(unique(df_tb_qc$VisitId)),   collapse = ", "), "\n")
+cat("Stimulus IDs       :", paste(sort(unique(df_tb_qc$StimulusId)), collapse = ", "), "\n")
+```
+
+# Cytokine analysis configuration
+
+```{r}
+#| label: cytokine-config
+
+cytokine_config <- list(
+
+  Mtb_Ag_IFNg = list(
+    name          = "Mtb-Ag IFNg",
+    cytokine_col  = "IFN_gamma_Simoa",
+    stim          = "TB Ag",
+    subtract_null = TRUE,
+    cutoff        = 0.4,
+    norm_col      = "IFNg_Norm"
+  ),
+
+  Null_IL1RA = list(
+    name          = "Null IL1RA",
+    cytokine_col  = "IL_1ra",
+    stim          = "Null",
+    subtract_null = FALSE,
+    cutoff        = 478.5,
+    norm_col      = "IL1RA_Null"
+  ),
+
+  Null_IL18 = list(
+    name          = "Null IL18",
+    cytokine_col  = "IL_18",
+    stim          = "Null",
+    subtract_null = FALSE,
+    cutoff        = 252,
+    norm_col      = "IL18_Null"
+  ),
+
+  Mtb_Ag_IL6 = list(
+    name          = "Mtb-Ag IL6",
+    cytokine_col  = "IL_6",
+    stim          = "TB Ag",
+    subtract_null = TRUE,
+    cutoff        = 12.25,
+    norm_col      = "IL6_Norm"
+  ),
+
+  Mtb_Ag_IL8 = list(
+    name          = "Mtb-Ag IL8",
+    cytokine_col  = "IL_8",
+    stim          = "TB Ag",
+    subtract_null = TRUE,
+    cutoff        = 3291,
+    norm_col      = "IL8_Norm"
+  ),
+
+  Mtb_Ag_IL1RA = list(
+    name          = "Mtb-Ag IL1RA",
+    cytokine_col  = "IL_1ra",
+    stim          = "TB Ag",
+    subtract_null = TRUE,
+    cutoff        = 676,
+    norm_col      = "IL1RA_Norm"
+  )
+)
+
+# Confirm all cytokine columns exist in the data
+for (key in names(cytokine_config)) {
+  col    <- cytokine_config[[key]]$cytokine_col
+  exists <- col %in% names(df_tb_qc)
+  cat(sprintf("%-20s cytokine_col = %-20s exists: %s\n", key, col, exists))
+}
+```
+
+# Helper functions
+
+```{r}
+#| label: helper-functions
+
+prepare_repeatability <- function(data, cfg) {
+
+  repeat_patients <- data %>%
+    filter(VisitId == "V1", StimulusId == "Null") %>%
+    group_by(PatientId, StimulusId, BatchId) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    filter(count == 4) %>%
+    pull(PatientId) %>%
+    unique()
+
+  cat(sprintf("[%s] Repeatability patients with 4 replicates: %d\n",
+              cfg$name, length(repeat_patients)))
+
+  stim_ids <- if (cfg$subtract_null) c("Null", cfg$stim) else "Null"
+
+  dat <- data %>%
+    filter(
+      VisitId    == "V1",
+      PatientId  %in% repeat_patients,
+      StimulusId %in% stim_ids
+    ) %>%
+    select(PatientId, BatchId, ReplicateId, StimulusId,
+           all_of(cfg$cytokine_col))
+
+  cat(sprintf("[%s] Repeatability rows: %d\n", cfg$name, nrow(dat)))
+
+  if (cfg$subtract_null) {
+
+    dat <- dat %>%
+      pivot_wider(
+        id_cols     = c("PatientId", "BatchId", "ReplicateId"),
+        names_from  = "StimulusId",
+        values_from = all_of(cfg$cytokine_col)
+      ) %>%
+      mutate(
+        !!cfg$norm_col := pmax(0, .data[[cfg$stim]] - Null),
+        PositiveFlag    = as.integer(.data[[cfg$norm_col]] >= cfg$cutoff)
+      )
+
+  } else {
+
+    dat <- dat %>%
+      filter(StimulusId == "Null") %>%
+      pivot_wider(
+        id_cols     = c("PatientId", "BatchId", "ReplicateId"),
+        names_from  = "StimulusId",
+        values_from = all_of(cfg$cytokine_col)
+      ) %>%
+      mutate(
+        !!cfg$norm_col := pmax(0, as.numeric(Null)),
+        PositiveFlag    = as.integer(.data[[cfg$norm_col]] >= cfg$cutoff)
+      )
+  }
+
+  cat(sprintf("[%s] Repeatability final rows: %d | Patients: %d\n",
+              cfg$name, nrow(dat), n_distinct(dat$PatientId)))
+
+  dat
+}
+
+# prepare_reproducibility
+
+prepare_reproducibility <- function(data, cfg) {
+
+  repro_patients <- data %>%
+    filter(VisitId == "V2", StimulusId == "Null") %>%
+    pull(PatientId) %>%
+    unique()
+
+  cat(sprintf("[%s] Reproducibility patients identified: %d\n",
+              cfg$name, length(repro_patients)))
+
+  stim_ids <- if (cfg$subtract_null) c("Null", cfg$stim) else "Null"
+
+  dat <- data %>%
+    filter(
+      ReplicateId == "A",
+      PatientId   %in% repro_patients,
+      StimulusId  %in% stim_ids
+    ) %>%
+    select(PatientId, BatchId, VisitId, StimulusId,
+           all_of(cfg$cytokine_col)) %>%
+    mutate(BatchId = ifelse(BatchId == "Batch_3", "Batch_1", BatchId))
+
+  cat(sprintf("[%s] Reproducibility rows: %d\n", cfg$name, nrow(dat)))
+
+  if (cfg$subtract_null) {
+
+    dat <- dat %>%
+      pivot_wider(
+        id_cols     = c("PatientId", "BatchId", "VisitId"),
+        names_from  = "StimulusId",
+        values_from = all_of(cfg$cytokine_col)
+      ) %>%
+      mutate(
+        !!cfg$norm_col := pmax(0, .data[[cfg$stim]] - Null),
+        PositiveFlag    = as.integer(.data[[cfg$norm_col]] >= cfg$cutoff)
+      )
+
+  } else {
+
+    dat <- dat %>%
+      filter(StimulusId == "Null") %>%
+      pivot_wider(
+        id_cols     = c("PatientId", "BatchId", "VisitId"),
+        names_from  = "StimulusId",
+        values_from = all_of(cfg$cytokine_col)
+      ) %>%
+      mutate(
+        !!cfg$norm_col := pmax(0, as.numeric(Null)),
+        PositiveFlag    = as.integer(.data[[cfg$norm_col]] >= cfg$cutoff)
+      )
+  }
+
+  cat(sprintf("[%s] Reproducibility final rows: %d | Patients: %d\n",
+              cfg$name, nrow(dat), n_distinct(dat$PatientId)))
+
+  dat
+}
+
+# compute_consistency
+
+compute_consistency <- function(dat, experiment_label) {
+  dat %>%
+    group_by(PatientId) %>%
+    summarise(
+      experiment           = experiment_label,
+      nb_measurements      = n(),
+      nb_positive          = sum(PositiveFlag),
+      positive_consistency = nb_positive / nb_measurements,
+      overall_consistency  = abs(positive_consistency - 0.5) / 0.5,
+      .groups = "drop"
+    )
+}
+
+# make_consistency_plot
+
+make_consistency_plot <- function(consistency_df, cfg,
+                                  active_tb, patient_order,
+                                  save_path = NULL) {
+
+  plot_df <- consistency_df %>%
+    mutate(
+      patient_type = factor(
+        ifelse(PatientId %in% active_tb, "Active TB", "Control"),
+        levels = c("Control", "Active TB")
+      ),
+      PatientId = factor(
+        PatientId,
+        levels = c(
+          patient_order,
+          setdiff(unique(as.character(PatientId)), patient_order)
+        )
+      )
+    )
+
+  summary_df <- plot_df %>%
+    group_by(experiment) %>%
+    summarise(
+      mean_pct = mean(overall_consistency * 100, na.rm = TRUE),
+      .groups  = "drop"
+    ) %>%
+    mutate(label = sprintf("Mean: %.1f%%", mean_pct))
+
+  p <- ggplot(
+    plot_df,
+    aes(x = PatientId, y = overall_consistency * 100, fill = patient_type)
+  ) +
+    geom_col(alpha = 0.85, width = 0.75) +
+    geom_text(
+      data        = summary_df,
+      aes(x = Inf, y = Inf, label = label),
+      hjust       = 1.1,
+      vjust       = 1.5,
+      size        = 3.5,
+      color       = "black",
+      fontface    = "bold",
+      inherit.aes = FALSE
+    ) +
+    facet_wrap(~ experiment, scales = "free_x") +
+    scale_fill_manual(
+      values = c("Control" = "#000099", "Active TB" = "red"),
+      name   = "Patient type"
+    ) +
+    scale_y_continuous(
+      limits = c(0, 105),
+      breaks = seq(0, 100, 20),
+      expand = c(0, 0)
+    ) +
+    labs(
+      title = paste0(cfg$name, " classification consistency"),
+      x     = "Patient ID",
+      y     = paste0(cfg$name, " classification consistency (%)")
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text.x        = element_text(angle = 45, hjust = 1,
+                                        size = 9, color = "black",
+                                        face = "bold"),
+      axis.text.y        = element_text(color = "black", face = "bold"),
+      axis.title         = element_text(color = "black", face = "bold"),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor   = element_blank(),
+      strip.background   = element_rect(fill = "#34495e"),
+      strip.text         = element_text(color = "white", face = "bold"),
+      plot.title         = element_text(hjust = 0.5, face = "bold"),
+      legend.position    = "top",
+      legend.title       = element_text(face = "bold")
+    )
+
+  print(p)
+
+  if (!is.null(save_path)) {
+    tag <- gsub(" ", "_", cfg$name)
+    ggsave(
+      file.path(save_path, paste0("S1B_consistency_", tag, ".png")),
+      plot = p, width = 8, height = 6, dpi = 300
+    )
+  }
+
+  invisible(p)
+}
+```
+
+# Define patient display order
+
+```{r}
+#| label: patient-order
+
+patient_order <- c(
+  "10001", "10006", "10007", "10009", "10014",
+  "10037", "10038", "10039", "10043",
+  "10042",
+  "P1", "P2", "P3", "P4"
+)
+```
+
+# Run all biomarker analyses
+
+```{r}
+#| label: run-all
+#| fig-width: 8
+#| fig-height: 6
+#| message: true
+#| warning: false
+
+all_consistency <- list()
+all_summary     <- list()
+
+for (key in names(cytokine_config)) {
+
+  cfg <- cytokine_config[[key]]
+
+  cat(sprintf("\n--- %s | cutoff = %.2f pg/mL ---\n", cfg$name, cfg$cutoff))
+
+  repeat_dat <- tryCatch(
+    prepare_repeatability(df_tb_qc, cfg),
+    error = function(e) {
+      message(sprintf("Repeatability failed for %s: %s", cfg$name, e$message))
+      NULL
+    }
+  )
+
+  if (is.null(repeat_dat) || nrow(repeat_dat) == 0) {
+    message(sprintf("%s: no repeatability data, skipping.", cfg$name))
+    next
+  }
+
+  repro_dat <- tryCatch(
+    prepare_reproducibility(df_tb_qc, cfg),
+    error = function(e) {
+      message(sprintf("Reproducibility failed for %s: %s", cfg$name, e$message))
+      NULL
+    }
+  )
+
+  if (is.null(repro_dat) || nrow(repro_dat) == 0) {
+    message(sprintf("%s: no reproducibility data, skipping.", cfg$name))
+    next
+  }
+
+  repeat_cons <- compute_consistency(repeat_dat, "Repeatability")
+  repro_cons  <- compute_consistency(repro_dat,  "Reproducibility")
+
+  repro_cons_filtered <- repro_cons %>%
+    filter(!PatientId %in% active_tb_patients)
+
+  cat(sprintf(
+    "Reproducibility: %d patients before filtering, %d after removing active TB\n",
+    nrow(repro_cons), nrow(repro_cons_filtered)
+  ))
+
+  consistency_df <- bind_rows(repro_cons_filtered, repeat_cons) %>%
+    mutate(biomarker = cfg$name)
+
+  all_consistency[[key]] <- consistency_df
+
+  summary_df <- consistency_df %>%
+    group_by(experiment) %>%
+    summarise(
+      biomarker          = cfg$name,
+      cutoff_pgmL        = cfg$cutoff,
+      n                  = n(),
+      n_control          = sum(!PatientId %in% active_tb_patients),
+      n_active_tb        = sum(PatientId  %in% active_tb_patients),
+      mean_consistency   = mean(overall_consistency   * 100, na.rm = TRUE),
+      median_consistency = median(overall_consistency * 100, na.rm = TRUE),
+      sd_consistency     = sd(overall_consistency     * 100, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  all_summary[[key]] <- summary_df
+
+  cat("Consistency summary:\n")
+  print(summary_df)
+
+  make_consistency_plot(
+    consistency_df = consistency_df,
+    cfg            = cfg,
+    active_tb      = active_tb_patients,
+    patient_order  = patient_order,
+    save_path      = output_cons
+  )
+}
+```
+
+# Save all results
+
+```{r}
+#| label: save-results
+
+all_consistency_df <- bind_rows(all_consistency)
+
+all_summary_df <- bind_rows(all_summary) %>%
+  arrange(biomarker, experiment)
+
+cat("Combined summary across all biomarkers:\n")
+print(all_summary_df, n = Inf)
+
+patient_type_summary <- all_consistency_df %>%
+  mutate(
+    patient_type = ifelse(
+      PatientId %in% active_tb_patients, "Active TB", "Control"
+    )
+  ) %>%
+  group_by(biomarker, experiment, patient_type) %>%
+  summarise(
+    n                  = n(),
+    mean_consistency   = mean(overall_consistency   * 100, na.rm = TRUE),
+    median_consistency = median(overall_consistency * 100, na.rm = TRUE),
+    sd_consistency     = sd(overall_consistency     * 100, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_xlsx(
+  list(
+    "Consistency_all"      = all_consistency_df,
+    "Summary_by_biomarker" = all_summary_df,
+    "Summary_by_type"      = patient_type_summary
+  ),
+  path = file.path(output_main, "Figure_S1B_consistency_results.xlsx")
+)
+
+cat("All outputs saved to:", output_main, "\n")
+```
+
+# Session information
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

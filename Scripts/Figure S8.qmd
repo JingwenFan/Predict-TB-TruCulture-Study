@@ -1,0 +1,220 @@
+---
+title: "Figure S8"
+subtitle: "Mtb lineage in SATVI TruCulture cohort (Figure S8A); Mtb lineage by treatment outcome (Figure S8B)"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Figure S8A shows the Mtb lineage distribution across the SATVI TruCulture cohort.
+Figure S8B shows lineage distribution stratified by treatment outcome, with pairwise
+Fisher's exact test p-values (Bonferroni-adjusted) comparing the success group against
+each of the other two outcome groups. Given the small sample sizes in the failure
+(n = 2) and relapse (n = 4) groups, all results should be treated as descriptive.
+
+# Load packages
+
+```{r}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggsignif)
+```
+
+# Define file paths
+
+```{r}
+input_file <- "Input/Demographic and clinical information.xlsx"
+output_s8  <- "Output/Figure_S8"
+
+dir.create(output_s8, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Lineage frequency table
+
+```{r}
+all_data %>%
+  count(main_lineage) %>%
+  mutate(percentage = round(n / sum(n) * 100, 1))
+```
+
+# Figure S8A: Pie chart
+
+```{r}
+pie_data <- all_data %>%
+  count(main_lineage) %>%
+  mutate(
+    percentage = n / sum(n) * 100,
+    label      = paste0(main_lineage, "\n", n, " (", round(percentage, 1), "%)")
+  )
+
+pie_chart <- ggplot(pie_data, aes(x = "", y = n, fill = main_lineage)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 0) +
+  scale_fill_manual(values = c("lineage2" = "#FF6600", "lineage4" = "#6699CC")) +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 5
+  ) +
+  labs(title = "Mtb lineage in SATVI TruCulture cohort") +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 14)
+  )
+
+pie_chart
+
+ggsave(
+  file.path(output_s8, "S8A_Mtb_lineage_pie_chart.png"),
+  plot   = pie_chart,
+  width  = 5,
+  height = 6,
+  units  = "in"
+)
+```
+
+# Pairwise Fisher's exact tests
+
+The success group is compared against treatment failure and confirmed relapse
+separately. P-values are Bonferroni-adjusted for two simultaneous tests.
+
+```{r}
+outcome_data <- all_data%>%
+  filter(Comments != "reinfection")
+
+outcome_levels <- c("success", "treatment failure", "confirmed relapse")
+
+lineage_table <- table(outcome_data$main_lineage, outcome_data$Comments)
+print(lineage_table)
+
+p_succ_fail    <- fisher.test(lineage_table[, c("success", "treatment failure")])$p.value
+p_succ_relapse <- fisher.test(lineage_table[, c("success", "confirmed relapse")])$p.value
+
+p_adj_fail    <- min(p_succ_fail    * 2, 1)
+p_adj_relapse <- min(p_succ_relapse * 2, 1)
+
+cat(sprintf(
+  "Success vs treatment failure:  raw p = %.3f | adjusted p = %.3f\n",
+  p_succ_fail, p_adj_fail
+))
+cat(sprintf(
+  "Success vs confirmed relapse:  raw p = %.3f | adjusted p = %.3f\n",
+  p_succ_relapse, p_adj_relapse
+))
+```
+
+```{r}
+format_p <- function(p) {
+  if (p < 0.001) return("p < 0.001")
+  paste0("p = ", sprintf("%.3f", p))
+}
+
+label_fail    <- format_p(p_adj_fail)
+label_relapse <- format_p(p_adj_relapse)
+
+cat(sprintf("Label for failure:  %s\n", label_fail))
+cat(sprintf("Label for relapse:  %s\n", label_relapse))
+```
+
+# Prepare data for Figure S8B
+
+```{r}
+plot_data <- outcome_data %>%
+  group_by(Comments, main_lineage) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Comments) %>%
+  mutate(
+    percentage = n / sum(n) * 100,
+    label      = paste0(n, " (", round(percentage, 1), "%)")
+  ) %>%
+  ungroup() %>%
+  mutate(Comments = factor(Comments, levels = outcome_levels))
+```
+
+# Figure S8B: Stacked bar by treatment outcome
+
+Significance brackets are placed above the bars. The bracket for the wider
+comparison (success vs confirmed relapse) is placed higher to avoid overlap.
+The y-axis is expanded to accommodate both brackets.
+
+```{r}
+lineage_by_outcome <- ggplot(
+    plot_data,
+    aes(x = Comments, y = percentage, fill = main_lineage)
+  ) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 4
+  ) +
+  geom_signif(
+    comparisons = list(
+      c("success", "treatment failure"),
+      c("success", "confirmed relapse")
+    ),
+    annotations = c(label_fail, label_relapse),
+    y_position  = c(107, 117),
+    tip_length  = 0.01,
+    textsize    = 3.5
+  ) +
+  scale_fill_manual(values = c("lineage2" = "#FF6600", "lineage4" = "#6699CC")) +
+  scale_y_continuous(limits = c(0, 130)) +
+  labs(
+    title = "Mtb lineage by treatment outcome",
+    x     = "Treatment outcome",
+    y     = "Percentage (%)"
+  ) +
+  theme_classic() +
+  theme(
+    plot.title  = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(size = 12, color = "black"),
+    axis.title  = element_text(size = 12, color = "black", face = "bold")
+  )
+
+lineage_by_outcome
+
+ggsave(
+  file.path(output_s8, "S8B_Mtb_lineage_by_outcome.png"),
+  plot   = lineage_by_outcome,
+  width  = 6.5,
+  height = 5,
+  units  = "in"
+)
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```
