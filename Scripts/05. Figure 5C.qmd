@@ -1,0 +1,127 @@
+---
+title: "Figure 5C"
+subtitle: "BMI change following successful treatment"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Line plot showing BMI change following successful treatment, colour coded by sex.
+
+# Load packages
+
+```{r}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+# Define file paths
+
+```{r}
+input_file  <- "Input/Cytokines_cleaned_log10_Predict-TB.xlsx"
+output_main <- "Output/05. Figure_5C"
+
+dir.create(output_main, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Filter and recode
+
+```{r}
+process_data <- all_data %>%
+  filter(Comments == "success") %>%
+  filter(Condition == "Null") %>%
+  mutate(
+    Visit = as.numeric(Visit),
+    BMI   = as.numeric(as.character(BMI)),
+    Sex   = factor(Sex, levels = c("Female", "Male"))
+  ) %>%
+  select(ID1, Visit, BMI, Sex) %>%
+  drop_na()
+
+str(process_data)
+```
+
+Line plot
+```{r}
+#| label: line-plot
+#| fig-width: 8
+#| fig-height: 6
+
+line_plot <- ggplot(process_data, aes(x = Visit, y = BMI, group = ID1)) +
+  geom_line(aes(color = Sex), linewidth = 0.5) +
+  geom_point(aes(color = Sex), size = 1) +
+  scale_color_manual(
+    values = c("Female" = "magenta", "Male" = "blue")
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 72, by = 8),
+  ) +
+  scale_y_continuous(
+    breaks = seq(12, 38, by = 2)
+  ) +
+  labs(
+    title = "BMI change following successful treatment",
+    x     = "Visit (Week)",
+    y     = "BMI",
+    color = "Sex"
+  ) +
+  guides(color = guide_legend(override.aes = list(linetype = 1, shape = 16))) +
+  theme(
+    panel.background = element_rect(fill = "white"),
+    panel.border     = element_rect(color = "black", fill = NA),
+    plot.background  = element_rect(fill = "white"),
+    axis.text        = element_text(color = "black"),
+    axis.title       = element_text(color = "black")
+  )
+
+print(line_plot)
+```
+Save plot
+```{r}
+#| label: save-output
+
+ggsave(
+  filename = file.path(output_main, "BMI change by sex.pdf"),
+  plot     = line_plot,
+  width    = 6.5,
+  height   = 4.5
+)
+
+cat("Output saved to:", output_main, "\n")
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```

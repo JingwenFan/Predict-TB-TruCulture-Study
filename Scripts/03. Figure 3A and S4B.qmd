@@ -1,0 +1,720 @@
+---
+title: "Figures 3A and S4B"
+subtitle: "Paired bagging Random Forest for NanoString biomarker identification (Figure S4B); ROC curves with 95% CI (Figure 3A)"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Figure S4B: paired bagging Random Forest to identify NanoString genes that
+distinguish pre-treatment (W0) from on-treatment (W16) samples in patients
+with successful treatment outcome (n = 33). Approximately 800 genes were
+measured at W0 and W16 only. For each bootstrap iteration, patients are
+sampled with replacement and both visits are included, preserving the paired
+structure. Importance scores are averaged across all valid iterations.
+
+Figure 3A: ROC curves with 95% bootstrap confidence intervals for the top
+genes identified by the Random Forest.
+
+# Load packages
+
+```{r}
+library(readxl)
+library(DataExplorer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(randomForest)
+library(caret)
+library(pROC)
+library(writexl)
+```
+
+# Define file paths
+
+```{r}
+input_file       <- "Input/Nanostring_Wide_log2_normalised.xlsx"
+output_fig3a_s4b <- "Output/03. Figure_3A_S4B"
+
+dir.create(output_fig3a_s4b, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Filter and recode
+
+One barcode (0408230288) is excluded as a quality control outlier. Stimulation
+labels are standardised to match the protein data naming convention.
+
+```{r}
+nano_data <- all_data %>%
+  filter(Comments == "success") %>%
+  mutate(
+    Stimulation = ifelse(Stimulation == "TB",   "Mtb_Ag", Stimulation),
+    Stimulation = ifelse(Stimulation == "NULL", "Null",   Stimulation),
+    Visit       = paste0("W", Visit)
+  ) %>%
+  filter(!Barcode %in% "0408230288") %>%
+  select(-Barcode)
+
+cat(sprintf("Rows: %d | Columns: %d\n", nrow(nano_data), ncol(nano_data)))
+cat(sprintf("Visits: %s\n",       paste(unique(nano_data$Visit),       collapse = ", ")))
+cat(sprintf("Stimulations: %s\n", paste(unique(nano_data$Stimulation), collapse = ", ")))
+```
+
+# Data overview
+
+```{r}
+plot_intro(nano_data)
+```
+
+# Variance filter at gene level
+
+```{r}
+meta_cols  <- names(nano_data)[1:4]
+gene_cols  <- names(nano_data)[5:819]
+
+variances      <- sapply(nano_data[, gene_cols], var, na.rm = TRUE)
+retained_genes <- names(variances[variances > 0.1])
+
+nano_data <- nano_data[, c(meta_cols, retained_genes)]
+
+cat(sprintf(
+  "Genes before filtering: %d | After filtering: %d\n",
+  length(gene_cols), length(retained_genes)
+))
+```
+
+# Average technical replicates and reshape to wide format
+
+Some donors have technical replicates at the same visit and stimulation. These
+are averaged before reshaping. Stimulation and gene name are combined into a
+single column name so each stimulation-gene pair becomes a separate predictor.
+
+```{r}
+nano_long <- nano_data %>%
+  pivot_longer(
+    cols      = all_of(retained_genes),
+    names_to  = "Gene",
+    values_to = "Count_log2"
+  )
+
+duplicates <- nano_long %>%
+  group_by(Donor, Visit, Comments, Stimulation, Gene) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  filter(n > 1)
+
+cat(sprintf("Duplicate rows found: %d\n", nrow(duplicates)))
+
+nano_log_wide <- nano_long %>%
+  mutate(combined_name = paste(Stimulation, Gene, sep = "_")) %>%
+  group_by(Donor, Visit, Comments, combined_name) %>%
+  summarise(Count_log2 = mean(Count_log2, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = combined_name,
+    values_from = Count_log2
+  )
+
+cat(sprintf("Wide format: %d rows | %d columns\n", nrow(nano_log_wide), ncol(nano_log_wide)))
+```
+
+# Clean column names
+
+Gene names can contain special characters that are invalid as R variable names.
+A lookup table maps original names to cleaned names for reference.
+
+```{r}
+original_names <- names(nano_log_wide)
+cleaned_names  <- make.names(original_names, unique = TRUE)
+
+name_map <- data.frame(
+  original = original_names,
+  cleaned  = cleaned_names,
+  stringsAsFactors = FALSE
+)
+
+names(nano_log_wide) <- cleaned_names
+
+renamed <- name_map %>% filter(original != cleaned)
+cat(sprintf("Columns renamed due to special characters: %d\n", nrow(renamed)))
+```
+
+# Check for missing values
+
+```{r}
+feature_cols_wide <- setdiff(names(nano_log_wide), c("Donor", "Visit", "Comments"))
+na_counts         <- colSums(is.na(nano_log_wide[, feature_cols_wide]))
+
+cat(sprintf(
+  "Columns with NAs: %d | Total NAs: %d | Missing rate: %.2f%%\n",
+  sum(na_counts > 0),
+  sum(na_counts),
+  100 * sum(na_counts) / (nrow(nano_log_wide) * length(feature_cols_wide))
+))
+
+nano_log_wide <- nano_log_wide[complete.cases(nano_log_wide), ]
+cat(sprintf("Complete rows retained: %d\n", nrow(nano_log_wide)))
+```
+
+# Hyperparameter configuration
+
+```{r}
+rf_config <- list(
+  W0_W16 = list(
+    patient_id_col     = "Donor",
+    visits             = c("W0", "W16"),
+    variance_threshold = 0.01,
+    n_random           = 10,
+    n_bags             = 100,
+    ntree              = 600,
+    n_bootstrap_roc    = 500,
+    top_n_genes        = 4
+  )
+)
+```
+
+# Helper functions
+
+`prepare_rf_data`: filters to the visit pair, converts Visit to a valid factor,
+removes low-variance features, and adds random reference features. The Comments
+column is excluded because it is outcome-related metadata, not a predictor.
+
+```{r}
+prepare_rf_data <- function(wide_data, config) {
+  visits             <- config$visits
+  variance_threshold <- config$variance_threshold
+  n_random           <- config$n_random
+  patient_id_col     <- config$patient_id_col
+
+  data_filt <- wide_data %>%
+    filter(Visit %in% visits) %>%
+    mutate(Visit = factor(Visit, levels = visits))
+
+  levels(data_filt$Visit) <- paste0("W", gsub("W", "", levels(data_filt$Visit)))
+
+  non_feature  <- c(patient_id_col, "Visit", "Comments")
+  feature_cols <- setdiff(names(data_filt), non_feature)
+  variances    <- sapply(data_filt[, feature_cols], var, na.rm = TRUE)
+  retained     <- names(variances[variances > variance_threshold])
+  data_filt    <- data_filt[, c(patient_id_col, "Visit", retained)]
+
+  gene_vals <- unlist(data_filt[, retained], use.names = FALSE)
+  rand_mean <- mean(gene_vals, na.rm = TRUE)
+  rand_sd   <- sd(gene_vals,   na.rm = TRUE)
+
+  set.seed(123)
+  random_cols <- paste0("Random_", seq_len(n_random))
+  for (col in random_cols) {
+    data_filt[[col]] <- rnorm(nrow(data_filt), mean = rand_mean, sd = rand_sd)
+  }
+
+  cat(sprintf(
+    "Visits: %s | Rows: %d | Features retained: %d | Random added: %d\n",
+    paste(visits, collapse = " vs "), nrow(data_filt),
+    length(retained), n_random
+  ))
+
+  list(data = data_filt, retained = retained, random_cols = random_cols)
+}
+```
+
+`tune_rf`: tunes `mtry` using patient-level grouped k-fold CV. All patients
+are in the CV pool since there is no held-out test set.
+
+```{r}
+tune_rf <- function(prep, config) {
+  data           <- prep$data
+  k_folds        <- config$k_folds
+  ntree          <- config$ntree
+  mtry_range     <- config$mtry_range
+  patient_id_col <- config$patient_id_col
+
+  patient_ids <- data[[patient_id_col]]
+  data_train  <- data[, !names(data) %in% patient_id_col]
+  n_pred      <- ncol(data_train) - 1
+
+  if (is.null(mtry_range)) {
+    mtry_range <- seq(2, floor(sqrt(n_pred)), by = 1)
+  }
+
+  set.seed(123)
+  group_folds <- groupKFold(patient_ids, k = k_folds)
+
+  train_f1 <- unique(patient_ids[group_folds[[1]]])
+  test_f1  <- unique(patient_ids)[!unique(patient_ids) %in% train_f1]
+  cat(sprintf(
+    "Fold 1 leakage check - Train: %d | Test: %d | Overlap: %d\n",
+    length(train_f1), length(test_f1),
+    length(intersect(train_f1, test_f1))
+  ))
+
+  ctrl <- trainControl(
+    method          = "cv",
+    index           = group_folds,
+    classProbs      = TRUE,
+    savePredictions = "final",
+    summaryFunction = twoClassSummary,
+    verboseIter     = FALSE
+  )
+
+  set.seed(123)
+  tuned <- tryCatch(
+    train(
+      Visit ~ .,
+      data       = data_train,
+      method     = "rf",
+      trControl  = ctrl,
+      tuneGrid   = expand.grid(mtry = mtry_range),
+      ntree      = ntree,
+      metric     = "ROC",
+      importance = TRUE
+    ),
+    error = function(e) { message("Tuning failed: ", e$message); NULL }
+  )
+
+  if (is.null(tuned)) stop("RF tuning failed.")
+
+  best_mtry <- tuned$bestTune$mtry
+  cat(sprintf("Best mtry: %d\n", best_mtry))
+  print(tuned)
+
+  best_mtry
+}
+```
+
+`bag_rf`: paired patient-level bootstrap RF. For each iteration, patients are
+sampled with replacement and both visits are included. Importance scores are
+averaged and SD computed across all valid iterations.
+
+```{r}
+bag_rf <- function(prep, best_mtry, config) {
+  data           <- prep$data
+  n_bags         <- config$n_bags
+  ntree          <- config$ntree
+  patient_id_col <- config$patient_id_col
+
+  patient_ids <- unique(data[[patient_id_col]])
+  n_patients  <- length(patient_ids)
+  imp_list    <- vector("list", n_bags)
+
+  set.seed(123)
+  for (b in seq_len(n_bags)) {
+    sampled <- sample(patient_ids, n_patients, replace = TRUE)
+
+    boot_data <- do.call(rbind, lapply(sampled, function(p) {
+      data[data[[patient_id_col]] == p, ]
+    }))
+
+    train_data       <- boot_data[, !names(boot_data) %in% patient_id_col]
+    train_data$Visit <- droplevels(train_data$Visit)
+
+    rf <- tryCatch(
+      randomForest(
+        Visit ~ .,
+        data       = train_data,
+        ntree      = ntree,
+        mtry       = best_mtry,
+        importance = TRUE
+      ),
+      error = function(e) NULL
+    )
+
+    if (!is.null(rf)) {
+      imp_list[[b]] <- importance(rf, type = 1, scale = TRUE)[, "MeanDecreaseAccuracy"]
+    }
+  }
+
+  imp_list <- Filter(Negate(is.null), imp_list)
+  n_valid  <- length(imp_list)
+  imp_mat  <- do.call(cbind, imp_list)
+
+  cat(sprintf("Valid bags: %d / %d\n", n_valid, n_bags))
+
+  list(
+    avg_importance = rowMeans(imp_mat),
+    sd_importance  = apply(imp_mat, 1, sd),
+    n_valid_bags   = n_valid
+  )
+}
+```
+
+`plot_importance_fig`: dot plot of top features ranked by average MDA.
+Features above the random threshold are shown in dark red.
+
+```{r}
+plot_importance_fig <- function(importance_vals,
+                                rand_threshold,
+                                title     = "Variable importance",
+                                save_path = NULL,
+                                filename  = "importance.png",
+                                top_n     = 75) {
+
+  sorted_vals <- sort(importance_vals, decreasing = TRUE)
+  n_show      <- min(top_n, length(sorted_vals))
+  top_vals    <- sorted_vals[seq_len(n_show)]
+  y_pos       <- n_show:1
+  dot_colors  <- ifelse(top_vals > rand_threshold, "darkred", "gray60")
+  n_sig       <- sum(
+    importance_vals[!grepl("^Random_", names(importance_vals))] > rand_threshold
+  )
+
+  draw_plot <- function() {
+    par(mar = c(5, 12, 4, 2))
+
+    x_min <- min(top_vals) * ifelse(min(top_vals) < 0, 1.1, 0.9)
+    x_max <- max(top_vals) * 1.2
+
+    plot(top_vals, y_pos,
+         type = "n", xlim = c(x_min, x_max),
+         yaxt = "n", xaxt = "n",
+         xlab = "Mean Decrease in Accuracy", ylab = "", main = title)
+
+    axis(1, at = seq(floor(min(top_vals)), ceiling(max(top_vals)),
+                     by = max(0.5, round(ceiling(max(top_vals)) / 5, 1))))
+    abline(h = y_pos, lty = "dotted", col = "gray80")
+    points(top_vals, y_pos, pch = 16, cex = 1.2, col = dot_colors)
+    text(par("usr")[1], y_pos, labels = names(top_vals),
+         pos = 2, xpd = TRUE, col = "black", cex = 0.9)
+    abline(v = rand_threshold, col = "gray40", lty = 2, lwd = 2)
+
+    usr <- par("usr")
+    text(usr[2] - (usr[2] - usr[1]) * 0.02,
+         usr[3] + (usr[4] - usr[3]) * 0.05,
+         labels = paste("Random threshold:", round(rand_threshold, 3)),
+         adj = c(1, 0), cex = 1, col = "gray40")
+    mtext(paste(n_sig, "genes above random threshold"),
+          side = 3, line = 0.5, cex = 0.8)
+  }
+
+  draw_plot()
+
+  if (!is.null(save_path)) {
+    png(file.path(save_path, filename), width = 2600, height = 4500, res = 300)
+    draw_plot()
+    dev.off()
+    cat(sprintf("Saved: %s\n", filename))
+  }
+
+  invisible(NULL)
+}
+```
+
+`run_roc`: patient-level bootstrap ROC. Uses `vapply` for faster bootstrapping
+and pre-indexes patients once to avoid repeated full-dataframe scans.
+
+```{r}
+run_roc <- function(data, gene, patient_id_col = "Donor", n_bootstrap = 500) {
+  tryCatch({
+    response  <- data$Visit == levels(data$Visit)[1]
+    predictor <- data[[gene]]
+    pid       <- data[[patient_id_col]]
+
+    roc_obj <- roc(response, predictor, direction = "auto", quiet = TRUE)
+
+    patient_index <- split(seq_along(pid), pid)
+    patient_names <- names(patient_index)
+    n_patients    <- length(patient_names)
+
+    boot_aucs <- vapply(seq_len(n_bootstrap), function(b) {
+      boot_idx <- unlist(
+        patient_index[sample(patient_names, n_patients, replace = TRUE)],
+        use.names = FALSE
+      )
+      boot_roc <- tryCatch(
+        roc(response[boot_idx], predictor[boot_idx],
+            direction = "auto", quiet = TRUE),
+        error = function(e) NULL
+        )
+      if (!is.null(boot_roc)) as.numeric(auc(boot_roc)) else NA_real_
+    }, numeric(1))
+
+    boot_aucs <- boot_aucs[!is.na(boot_aucs)]
+
+    list(
+      roc          = roc_obj,
+      auc          = as.numeric(auc(roc_obj)),
+      ci_lower     = quantile(boot_aucs, 0.025),
+      ci_upper     = quantile(boot_aucs, 0.975),
+      n_valid_boot = length(boot_aucs)
+    )
+  }, error = function(e) {
+    message("ROC failed for ", gene, ": ", e$message)
+    NULL
+  })
+}
+```
+
+`plot_roc_curves`: ROC curves with AUC and CI in the legend.
+
+```{r}
+plot_roc_curves <- function(roc_results,
+                             title     = "ROC curves",
+                             save_path = NULL,
+                             filename  = "roc.png") {
+
+  colors <- c("#000000", "#00CCFF", "#33CC66", "#9933CC")
+
+  draw_plot <- function() {
+    par(mar = c(5, 5, 4, 2))
+    plot(roc_results[[1]]$roc,
+         col = colors[1], main = title,
+         xlab = "1 - Specificity", ylab = "Sensitivity",
+         lwd = 2, cex.main = 1.2, cex.lab = 1.1, cex.axis = 1.0,
+         legacy.axes = TRUE)
+
+    if (length(roc_results) > 1) {
+      for (i in seq(2, length(roc_results))) {
+        plot(roc_results[[i]]$roc, col = colors[i], add = TRUE, lwd = 2)
+      }
+    }
+
+    grid()
+
+    legend("bottomright",
+           legend = sapply(names(roc_results), function(g) {
+             r <- roc_results[[g]]
+             sprintf("%s  AUC = %.2f (95%% CI: %.2f - %.2f)",
+                     g, r$auc, r$ci_lower, r$ci_upper)
+           }),
+           col = colors[seq_along(roc_results)],
+           lty = 1, lwd = 2, cex = 0.9, bg = "white", box.lwd = 1)
+  }
+
+  draw_plot()
+
+  if (!is.null(save_path)) {
+    png(file.path(save_path, filename), width = 1800, height = 2000,
+        res = 300, bg = "white")
+    draw_plot()
+    dev.off()
+    cat(sprintf("Saved: %s\n", filename))
+  }
+
+  invisible(NULL)
+}
+```
+
+`build_summary`: summary table with AUC, CI, and Youden threshold metrics.
+
+```{r}
+build_summary <- function(roc_results) {
+  get_coords <- function(roc_obj) {
+    opt <- coords(roc_obj, x = "best", best.method = "youden",
+                  ret = c("threshold", "sensitivity", "specificity", "ppv", "npv"),
+                  transpose = FALSE)
+    if (nrow(opt) > 1) opt <- opt[which.max(opt$sensitivity), ]
+    opt
+  }
+
+  do.call(rbind, lapply(names(roc_results), function(g) {
+    r   <- roc_results[[g]]
+    opt <- tryCatch(get_coords(r$roc), error = function(e) NULL)
+    if (is.null(opt)) return(NULL)
+
+    data.frame(
+      Gene              = g,
+      AUC               = round(r$auc, 3),
+      CI_Lower          = round(r$ci_lower, 3),
+      CI_Upper          = round(r$ci_upper, 3),
+      Optimal_Threshold = round(opt$threshold, 4),
+      Sensitivity_pct   = round(opt$sensitivity * 100, 1),
+      Specificity_pct   = round(opt$specificity * 100, 1),
+      PPV_pct           = round(opt$ppv * 100, 1),
+      NPV_pct           = round(opt$npv * 100, 1),
+      Youden_J          = round(opt$sensitivity + opt$specificity - 1, 3),
+      N_Bootstrap       = r$n_valid_boot,
+      stringsAsFactors  = FALSE
+    )
+  }))
+}
+```
+
+`query_gene`: runs ROC for a single gene and prints a concise summary. Use
+`name_map` to find the cleaned version of a gene name if needed.
+
+```{r}
+query_gene <- function(gene_name,
+                       data           = nano_log_wide,
+                       patient_id_col = "Donor",
+                       n_bootstrap    = 500,
+                       gene_mda       = NULL,
+                       rand_threshold = NULL) {
+
+  if (!gene_name %in% names(data)) {
+    cat(sprintf(
+      "Gene not found: %s\nCheck name_map for the cleaned version of this name.\n",
+      gene_name
+    ))
+    return(invisible(NULL))
+  }
+
+  set.seed(123)
+  result <- run_roc(
+    data           = data,
+    gene           = gene_name,
+    patient_id_col = patient_id_col,
+    n_bootstrap    = n_bootstrap
+  )
+
+  if (is.null(result)) return(invisible(NULL))
+
+  opt <- tryCatch({
+    o <- coords(result$roc, x = "best", best.method = "youden",
+                ret = c("threshold", "sensitivity", "specificity", "ppv", "npv"),
+                transpose = FALSE)
+    if (nrow(o) > 1) o <- o[which.max(o$sensitivity), ]
+    o
+  }, error = function(e) NULL)
+
+  mda_val      <- if (!is.null(gene_mda) && gene_name %in% names(gene_mda)) gene_mda[[gene_name]] else NA
+  above_thresh <- !is.na(mda_val) && !is.null(rand_threshold) && mda_val > rand_threshold
+
+  cat(sprintf(
+    "\n%s\nAUC: %.3f  |  95%% CI: %.3f - %.3f  |  Bootstrap n: %d\n",
+    gene_name, result$auc, result$ci_lower, result$ci_upper, result$n_valid_boot
+  ))
+
+  if (!is.na(mda_val)) {
+    cat(sprintf(
+      "MDA: %.3f  |  Above random threshold: %s\n",
+      mda_val, ifelse(above_thresh, "Yes", "No")
+    ))
+  }
+
+  if (!is.null(opt)) {
+    cat(sprintf(
+      "Optimal threshold: %.4f  |  Sensitivity: %.1f%%  |  Specificity: %.1f%%\n",
+      opt$threshold, opt$sensitivity * 100, opt$specificity * 100
+    ))
+    cat(sprintf(
+      "PPV: %.1f%%  |  NPV: %.1f%%  |  Youden J: %.3f\n",
+      opt$ppv * 100, opt$npv * 100, opt$sensitivity + opt$specificity - 1
+    ))
+  }
+
+  invisible(result)
+}
+```
+
+# Visit 0 vs Visit 16 (Figures 3A and S4B)
+
+```{r}
+prep_16 <- prepare_rf_data(nano_log_wide, rf_config$W0_W16)
+mtry_16 <- floor(sqrt(ncol(prep_16$data) - 2)) 
+cat(sprintf("Default mtry: %d\n", mtry_16))
+bag_16  <- bag_rf(prep_16, mtry_16, rf_config$W0_W16)
+```
+
+```{r}
+avg_imp_16   <- bag_16$avg_importance
+is_rand_16   <- grepl("^Random_", names(avg_imp_16))
+threshold_16 <- mean(avg_imp_16[is_rand_16])
+gene_mda_16  <- avg_imp_16[!is_rand_16]
+sig_16       <- sort(gene_mda_16[gene_mda_16 > threshold_16], decreasing = TRUE)
+top_genes_16 <- names(head(sig_16, rf_config$W0_W16$top_n_genes))
+
+cat(sprintf(
+  "Threshold: %.3f | Genes above threshold: %d | Top %d: %s\n",
+  threshold_16, length(sig_16), length(top_genes_16),
+  paste(top_genes_16, collapse = ", ")
+))
+print(sig_16)
+```
+
+```{r}
+#| fig-height: 14
+
+plot_importance_fig(
+  importance_vals = avg_imp_16,
+  rand_threshold  = threshold_16,
+  title           = "Variable importance: Visit 0 vs Visit 16",
+  save_path       = output_fig3a_s4b,
+  filename        = "S4B_importance_W0_W16.png"
+)
+```
+
+```{r}
+set.seed(123)
+roc_16 <- list()
+for (gene in top_genes_16) {
+  cat(sprintf("ROC: %s\n", gene))
+  roc_16[[gene]] <- run_roc(
+    data           = prep_16$data,
+    gene           = gene,
+    patient_id_col = rf_config$W0_W16$patient_id_col,
+    n_bootstrap    = rf_config$W0_W16$n_bootstrap_roc
+  )
+}
+roc_16 <- Filter(Negate(is.null), roc_16)
+
+for (gene in names(roc_16)) {
+  r <- roc_16[[gene]]
+  cat(sprintf("  %-30s AUC: %.3f (95%% CI: %.3f - %.3f) | Bootstrap n: %d\n",
+              gene, r$auc, r$ci_lower, r$ci_upper, r$n_valid_boot))
+}
+```
+
+```{r}
+plot_roc_curves(
+  roc_results = roc_16,
+  title       = "ROC curves: Visit 0 vs Visit 16",
+  save_path   = output_fig3a_s4b,
+  filename    = "3A_ROC_W0_W16.png"
+)
+```
+
+```{r}
+summary_16 <- build_summary(roc_16)
+print(summary_16)
+
+write_xlsx(summary_16, file.path(output_fig3a_s4b, "ROC_summary_W0_W16.xlsx"))
+```
+
+# Query individual genes
+
+Use `name_map` to find the cleaned version of any gene name containing special
+characters, then pass the cleaned name to `query_gene`.
+
+```{r}
+# Find the cleaned name for a gene of interest
+name_map %>% filter(grepl("NLRP3", original, ignore.case = TRUE))
+```
+
+```{r}
+query_gene(
+  gene_name      = "LPS_NLRP3",
+  data           = prep_16$data,
+  patient_id_col = "Donor",
+  gene_mda       = gene_mda_16,
+  rand_threshold = threshold_16
+)
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```

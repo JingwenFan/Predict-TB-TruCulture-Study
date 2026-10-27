@@ -1,0 +1,287 @@
+---
+title: "Figure S13A"
+subtitle: "Assessment of multicollinearity among demographic and clinical factors using the variance inflation factor (VIF)"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Assessment of multicollinearity among demographic and clinical factors using the
+variance inflation factor (VIF). VIF is calculated for each variable by regressing
+it against all other variables and computing VIF = 1 / (1 - R²). VIF < 5 indicates
+low multicollinearity; VIF 5-10 moderate; VIF > 10 high.
+
+# Load packages
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(writexl)
+```
+
+# Define file paths
+
+```{r}
+#| label: file-paths
+
+input_file  <- "Input/Demographic and clinical information.xlsx"
+input_pet   <- "Input/PET.CT_long_SATVI.xlsx"
+input_mtb   <- "Input/Mtb.lineage_SATVI_ID_Predict-TB_TS.xlsx"
+output_main <- "Output/Figure_S13A"
+
+dir.create(output_main, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+#| label: load-data
+
+demo_data <- read_excel(input_file, sheet = 1) %>%
+  filter(Comments == "success")
+
+str(demo_data)
+
+pet_data <- read_excel(input_pet, sheet = 1) %>%
+  filter(Comments == "success") %>%
+  filter(Visit == 0) %>%                
+  select(ID1, Visit, CAVTOT, TLG) %>%
+  mutate(
+    CAVTOT = log10(1 + CAVTOT),
+    TLG    = log10(1 + TLG)
+  )
+
+head(pet_data)
+dim(pet_data)
+
+mtb_data <- read_excel(input_mtb, sheet = 1) %>%
+  filter(Comments == "success") %>%
+  select(ID1, main_lineage)
+
+head(mtb_data)
+dim(mtb_data)
+```
+
+# Merge data sets
+
+```{r}
+#| label: merge-data
+
+all_data <- demo_data %>%
+  left_join(pet_data, by = "ID1") %>%
+  left_join(mtb_data, by = "ID1") %>%
+  select(ID1, Age, Sex, BMI_0, Temp_0, Smoking, MGIT_0,
+         main_lineage, Previous_TB, Arm, CAVTOT, TLG)
+
+dim(all_data)
+head(all_data)
+```
+
+# Curate data for VIF analysis
+
+```{r}
+#| label: curate-data
+
+# Clean and encode all variables
+test_data <- all_data %>%
+  mutate(
+    Age          = as.numeric(Age),
+    BMI_0        = as.numeric(BMI_0),
+    Temp_0       = as.numeric(Temp_0),
+    MGIT_0       = as.numeric(MGIT_0),
+    CAVTOT       = as.numeric(CAVTOT),
+    TLG          = as.numeric(TLG),       
+    Sex          = factor(Sex,          levels = c("Female",   "Male")),
+    Smoking      = factor(
+                     ifelse(Smoking == "active smoker", "active_smoker_Yes", "active_smoker_No"),
+                     levels = c("active_smoker_No", "active_smoker_Yes")
+                   ),
+    main_lineage = factor(main_lineage,  levels = c("lineage2", "lineage4")),
+    Arm          = factor(Arm,           levels = c("A", "B", "C")),
+    Previous_TB  = factor(
+                     ifelse(Previous_TB == "0 episode", "No", "Yes"),
+                     levels = c("No", "Yes")
+                   )
+  )
+
+str(test_data)
+
+# Convert all variables to numeric for VIF regression
+vif_data <- test_data %>%
+  select(-ID1) %>%
+  mutate(
+    Sex          = as.numeric(Sex)          - 1,   # Female=0, Male=1
+    Smoking      = as.numeric(Smoking)      - 1,   # No=0, Yes=1
+    main_lineage = as.numeric(main_lineage) - 1,   # lineage2=0, lineage4=1
+    Previous_TB  = as.numeric(Previous_TB)  - 1,   # No=0, Yes=1
+    Arm          = as.numeric(Arm)                  # A=1, B=2, C=3
+  ) %>%
+  drop_na()
+
+cat(sprintf("Participants available for VIF analysis: %d\n", nrow(vif_data)))
+cat(sprintf("Variables tested: %d\n", ncol(vif_data)))
+```
+
+# Calculate VIF
+
+```{r}
+#| label: calculate-vif
+#| message: true
+
+all_vars <- names(vif_data)
+
+vif_results <- data.frame(
+  Variable = character(),
+  VIF      = numeric()
+)
+
+for (var in all_vars) {
+
+  other_vars  <- setdiff(all_vars, var)
+
+  formula_str <- paste(var, "~", paste(other_vars, collapse = " + "))
+
+  tryCatch({
+    model     <- lm(formula_str, data = vif_data)
+    r_squared <- summary(model)$r.squared
+    vif_value <- 1 / (1 - r_squared)
+
+    vif_results <- rbind(vif_results, data.frame(
+      Variable = var,
+      VIF      = round(vif_value, 3)
+    ))
+  }, error = function(e) {
+    message("Error calculating VIF for ", var, ": ", e$message)
+  })
+}
+
+# Add interpretation tier
+vif_results <- vif_results %>%
+  mutate(
+    Interpretation = case_when(
+      VIF < 5  ~ "Low",
+      VIF < 10 ~ "Moderate",
+      TRUE     ~ "High"
+    )
+  ) %>%
+  arrange(desc(VIF))
+
+print(vif_results)
+```
+
+# VIF plot
+
+```{r}
+#| label: vif-plot
+#| fig-width: 8
+#| fig-height: 6
+
+# Cleaner variable labels for the plot
+var_labels <- c(
+  "Age"          = "Age",
+  "Sex"          = "Sex",
+  "BMI_0"        = "BMI",
+  "Temp_0"       = "Temperature",
+  "Smoking"      = "Smoking",
+  "MGIT_0"       = "MGIT Mtb burden",
+  "main_lineage" = "Mtb lineage",
+  "Previous_TB"  = "Previous TB",
+  "Arm"          = "Trial Arm",
+  "CAVTOT"       = "Total cavity volume",
+  "TLG"          = "Total lesion glycolysis"
+)
+
+# Desired display order (top to bottom on flipped plot)
+var_order <- c(
+  "Age", "Sex", "BMI_0", "Temp_0", "Smoking",
+  "MGIT_0", "main_lineage", "Previous_TB", "Arm",
+  "CAVTOT", "TLG"
+)
+
+vif_results <- vif_results %>%
+  mutate(
+    Variable       = factor(Variable, levels = rev(var_order)),
+    Variable_label = var_labels[as.character(Variable)]
+  )
+
+vif_plot <- ggplot(vif_results, aes(x = Variable, y = VIF, fill = VIF > 5)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 5,  linetype = "dashed", color = "orange", linewidth = 0.7) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red",    linewidth = 0.7) +
+  geom_text(aes(label = sprintf("%.2f", VIF)), hjust = -0.2, size = 3.5) +
+  coord_flip(clip = "off") +
+  scale_x_discrete(labels = setNames(var_labels, names(var_labels))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(
+    values = c("FALSE" = "skyblue", "TRUE" = "coral"),
+    labels = c("FALSE" = "Acceptable (VIF < 5)", "TRUE" = "Problematic (VIF >= 5)"),
+    name   = "Multicollinearity"
+  ) +
+  labs(
+    title    = "Variance Inflation Factors (VIF)",
+    subtitle = "Dashed lines: orange = VIF 5 threshold, red = VIF 10 threshold",
+    x        = NULL,
+    y        = "VIF"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.border     = element_rect(color = "black", fill = NA),
+    legend.position  = "bottom",
+    axis.text        = element_text(color = "black"),
+    axis.title       = element_text(color = "black")
+  )
+
+print(vif_plot)
+```
+
+# Save outputs
+
+```{r}
+#| label: save-outputs
+
+ggsave(
+  filename = file.path(output_main, "VIF_plot.pdf"),
+  plot     = vif_plot,
+  width    = 8,
+  height   = 6
+)
+
+write_xlsx(
+  vif_results,
+  path = file.path(output_main, "VIF_multicollinearity among demographic and clinical factors.xlsx")
+)
+
+cat("Outputs saved to:", output_main, "\n")
+```
+
+# Session information
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

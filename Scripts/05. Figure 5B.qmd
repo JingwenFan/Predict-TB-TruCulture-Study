@@ -1,0 +1,456 @@
+---
+title: "Figure 5B"
+subtitle: "Linear mixed-effects models of age and treatment effect on protein biomarkers"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Linear mixed-effects models are used to test whether Age and treatment (visit
+timepoint) can affect protein biomarker levels, and whether there is an interaction of
+age-treatment impact on protein biomarkers. FDR correction is applied across cytokines 
+within each stimulation. A threshold of p < 0.05 is used to identify significant effects.
+
+Figure 5B: Age and treatment effect on protein biomarkers across stimulation
+conditions.
+
+For each cytokine and stimulation condition a model of the form
+`Cytokine_Value ~ Visit * Age + Sex + Arm + (1|ID1)` is fitted. The
+interaction term tests whether the association between Age and cytokine level
+differs between visits. All plots are saved regardless of significance.
+
+# Load packages
+
+```{r}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(DataExplorer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(car)
+library(emmeans)
+library(writexl)
+```
+
+# Define file paths
+
+```{r}
+input_file  <- "Input/Cytokines_cleaned_log10_Predict-TB.xlsx"
+output_main <- "Output/05. Figure_5B"
+
+dir.create(output_main, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Filter and recode
+
+```{r}
+cytokine_data <- all_data %>%
+  filter(Comments == "success") %>%
+  mutate(
+    Condition = ifelse(Condition == "TB", "Mtb_Ag", Condition),
+    Visit     = paste0("W", Visit),
+    Age       = as.numeric(Age),
+    Sex       = factor(Sex, levels = c("Female", "Male")),
+    Arm       = factor(Arm, levels = c("A", "B", "C"))
+  )
+
+cat(sprintf("Rows: %d | Visits: %s\n",
+            nrow(cytokine_data),
+            paste(sort(unique(cytokine_data$Visit)), collapse = ", ")))
+```
+
+# Define cytokine columns
+
+```{r}
+meta_cols <- c("ID1", "Visit", "Condition", "Comments", "Age", "Sex", "Arm")
+
+cytokine_cols <- c(
+  "BDNF", "CCL11", "Factor_VII", "ICAM_1",
+  "IL_1_alpha", "IL_1_beta", "IL_10", "IL_12p40",
+  "IL_12p70", "IL_18", "IL_1RA", "IL_3", "IL_4",
+  "IL_6", "IL_7", "IL_8", "CCL2", "CCL3",
+  "MMP_3", "TNF", "VEGF", "IFNG", "IL_2",
+  "pan_IFNA", "IFNB"
+)
+
+cat(sprintf("Cytokines retained: %d\n", length(cytokine_cols)))
+```
+
+# Reshape to long format
+
+Each row represents one cytokine measurement for one patient at one visit.
+
+```{r}
+data_long <- cytokine_data %>%
+  pivot_longer(
+    cols      = all_of(cytokine_cols),
+    names_to  = "Cytokine",
+    values_to = "Cytokine_Value"
+  )
+
+cat(sprintf(
+  "Rows: %d | Cytokines: %d | Patients: %d\n",
+  nrow(data_long),
+  n_distinct(data_long$Cytokine),
+  n_distinct(data_long$ID1)
+))
+```
+
+# Visit colours
+
+```{r}
+visit_colors <- c("W0" = "#000000", "W16" = "orange", "W24" = "#00CCFF", "W72" = "purple")
+```
+
+# LME screening function
+
+`screen_lme`: fits `Cytokine_Value ~ Visit * Age + Sex + Arm + (1|ID1)` for
+one cytokine and one stimulation condition. Returns Wald chi-square p-values
+for the Visit main effect, Age main effect, and their interaction. Returns
+NULL if data are insufficient.
+
+```{r}
+screen_lme <- function(data, cytokine_name,
+                       stimulation  = NULL,
+                       covariates   = NULL,
+                       min_obs      = 10,
+                       min_subjects = 5) {
+
+  dat <- data %>%
+    filter(
+      Cytokine == cytokine_name,
+      !is.na(Cytokine_Value),
+      !is.na(Age)
+    )
+
+  if (!is.null(stimulation)) {
+    dat <- dat %>% filter(Condition == stimulation)
+  }
+
+  dat <- dat %>%
+    mutate(
+      ID1   = as.factor(ID1),
+      Visit = factor(Visit, levels = c("W0", "W16", "W24", "W72"))
+    )
+
+  if (nrow(dat) < min_obs || n_distinct(dat$ID1) < min_subjects) return(NULL)
+
+  covariate_terms <- if (!is.null(covariates)) paste(covariates, collapse = " + ") else NULL
+  formula_str     <- paste(
+    "Cytokine_Value ~ Visit * Age",
+    if (!is.null(covariate_terms)) paste("+", covariate_terms),
+    "+ (1|ID1)"
+  )
+
+  tryCatch({
+    model     <- lmer(as.formula(formula_str), data = dat, REML = FALSE)
+    anova_res <- Anova(model, type = 3)
+
+    data.frame(
+      Cytokine      = cytokine_name,
+      Stimulation   = if (!is.null(stimulation)) stimulation else "All",
+      Visit_p       = anova_res["Visit",     "Pr(>Chisq)"],
+      Age_p         = anova_res["Age",       "Pr(>Chisq)"],
+      Interaction_p = anova_res["Visit:Age", "Pr(>Chisq)"],
+      N_obs         = nrow(dat),
+      N_subjects    = n_distinct(dat$ID1),
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) {
+    message("LME failed for ", cytokine_name, " | ", stimulation, ": ", e$message)
+    NULL
+  })
+}
+```
+
+# P-value formatting helper
+
+```{r}
+format_p <- function(p) {
+  stars <- if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else ""
+  label <- if (p < 0.001) "p < 0.001" else sprintf("p = %.3f", p)
+  paste0(label, stars)
+}
+```
+
+# LME plot function
+
+`plot_lme`: fits the same model as `screen_lme` and generates a scatter plot
+with LME-predicted regression lines per visit and 95% confidence bands from
+emmeans, adjusted to the mean values of Sex and Arm. Raw p-values with
+significance stars are shown in the subtitle. Regression equations per visit
+and the covariate adjustment note are annotated in the top right corner.
+
+```{r}
+plot_lme <- function(data, cytokine_name,
+                     visit_colors, stimulation = NULL,
+                     covariates = NULL, save_path = NULL) {
+
+  dat <- data %>%
+    filter(
+      Cytokine == cytokine_name,
+      !is.na(Cytokine_Value),
+      !is.na(Age)
+    )
+
+  if (!is.null(stimulation)) {
+    dat <- dat %>% filter(Condition == stimulation)
+  }
+
+  dat <- dat %>%
+    mutate(
+      ID1   = as.factor(ID1),
+      Visit = factor(Visit, levels = c("W0", "W16", "W24", "W72"))
+    )
+
+  if (nrow(dat) < 10 || n_distinct(dat$ID1) < 5) return(invisible(NULL))
+
+  covariate_terms <- if (!is.null(covariates)) paste(covariates, collapse = " + ") else NULL
+  formula_str     <- paste(
+    "Cytokine_Value ~ Visit * Age",
+    if (!is.null(covariate_terms)) paste("+", covariate_terms),
+    "+ (1|ID1)"
+  )
+
+  model <- tryCatch(
+    lmer(as.formula(formula_str), data = dat, REML = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) return(invisible(NULL))
+
+  anova_res     <- Anova(model, type = 3)
+  visit_p       <- anova_res["Visit",     "Pr(>Chisq)"]
+  age_p         <- anova_res["Age",       "Pr(>Chisq)"]
+  interaction_p <- anova_res["Visit:Age", "Pr(>Chisq)"]
+
+  age_seq <- seq(
+    min(dat$Age, na.rm = TRUE),
+    max(dat$Age, na.rm = TRUE),
+    length.out = 50
+  )
+
+  pred <- as.data.frame(
+    emmeans(model, ~ Visit * Age,
+            at = list(Age = age_seq))
+  )
+
+  coefs         <- fixef(model)
+  intercept_w0  <- coefs["(Intercept)"]
+  slope_w0      <- coefs["Age"]
+
+  intercept_w16 <- intercept_w0 +
+    ifelse("VisitW16" %in% names(coefs), coefs["VisitW16"], 0)
+  slope_w16     <- slope_w0 +
+    ifelse("VisitW16:Age" %in% names(coefs), coefs["VisitW16:Age"], 0)
+
+  intercept_w24 <- intercept_w0 +
+    ifelse("VisitW24" %in% names(coefs), coefs["VisitW24"], 0)
+  slope_w24     <- slope_w0 +
+    ifelse("VisitW24:Age" %in% names(coefs), coefs["VisitW24:Age"], 0)
+
+  intercept_w72 <- intercept_w0 +
+    ifelse("VisitW72" %in% names(coefs), coefs["VisitW72"], 0)
+  slope_w72     <- slope_w0 +
+    ifelse("VisitW72:Age" %in% names(coefs), coefs["VisitW72:Age"], 0)
+
+  visits_present <- levels(droplevels(dat$Visit))
+
+  eq_lines <- c()
+  if ("W0"  %in% visits_present)
+    eq_lines <- c(eq_lines, sprintf("W0:  y = %.3fx %s %.3f",
+      slope_w0,  ifelse(intercept_w0  >= 0, "+", "-"), abs(intercept_w0)))
+  if ("W16" %in% visits_present)
+    eq_lines <- c(eq_lines, sprintf("W16: y = %.3fx %s %.3f",
+      slope_w16, ifelse(intercept_w16 >= 0, "+", "-"), abs(intercept_w16)))
+  if ("W24" %in% visits_present)
+    eq_lines <- c(eq_lines, sprintf("W24: y = %.3fx %s %.3f",
+      slope_w24, ifelse(intercept_w24 >= 0, "+", "-"), abs(intercept_w24)))
+  if ("W72" %in% visits_present)
+    eq_lines <- c(eq_lines, sprintf("W72: y = %.3fx %s %.3f",
+      slope_w72, ifelse(intercept_w72 >= 0, "+", "-"), abs(intercept_w72)))
+
+  eq_label   <- paste(eq_lines, collapse = "\n")
+  stim_label <- if (!is.null(stimulation)) stimulation else "All conditions"
+  x_unit     <- if (cytokine_name == "pan_IFNA") "log10 fg/mL" else "log10 pg/mL"
+
+  p <- ggplot() +
+    geom_ribbon(
+      data = pred,
+      aes(x = Age, ymin = lower.CL, ymax = upper.CL, fill = Visit),
+      alpha = 0.2
+    ) +
+    geom_line(
+      data = pred,
+      aes(x = Age, y = emmean, color = Visit),
+      linewidth = 1.5
+    ) +
+    geom_point(
+      data = dat,
+      aes(x = Age, y = Cytokine_Value, color = Visit),
+      alpha = 0.6, size = 2.5
+    ) +
+    annotate(
+      "text",
+      x = Inf, y = Inf, label = eq_label,
+      hjust = 1.05, vjust = 1.5, size = 3.2,
+      fontface = "italic", color = "gray30"
+    ) +
+    scale_color_manual(values = visit_colors, name = "Visit") +
+    scale_fill_manual(values  = visit_colors, name = "Visit") +
+    labs(
+      title    = paste0(cytokine_name, "  (", stim_label, ")"),
+      subtitle = paste0(
+        "Visit: ",       format_p(visit_p),       "  |  ",
+        "Age: ",         format_p(age_p),          "  |  ",
+        "Interaction: ", format_p(interaction_p)
+      ),
+      x       = "Age (years)",
+      y       = paste0(cytokine_name, " (", x_unit, ")"),
+      caption = paste0(
+        "LME: Cytokine_Value ~ Visit * Age",
+        if (!is.null(covariates)) paste0(" + ", paste(covariates, collapse = " + ")),
+        " + (1|ID1)"
+      )
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position     = "top",
+      plot.title          = element_text(face = "bold"),
+      plot.subtitle       = element_text(size = 9, color = "gray40"),
+      panel.grid.major    = element_line(color = "grey85", linewidth = 0.4),
+      panel.grid.minor    = element_line(color = "grey92", linewidth = 0.2)
+    )
+
+  print(p)
+
+  if (!is.null(save_path)) {
+    ggsave(
+      file.path(save_path,
+                paste0(cytokine_name, "_", stim_label, "_LME_Age.pdf")),
+      plot = p, width = 8, height = 6, units = "in"
+    )
+  }
+
+  invisible(p)
+}
+```
+
+# Run all analyses
+
+All cytokines are screened and plotted for each stimulation condition. FDR
+correction is applied across cytokines within each stimulation. All plots are
+saved regardless of significance.
+
+```{r}
+all_analyses <- list()
+stimulations <- c("Null", "Mtb_Ag", "LPS", "IL1B")
+covariates   <- c("Sex", "Arm")
+
+for (stim in stimulations) {
+  out_dir <- file.path(output_main, stim)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+  cat(sprintf("\nStimulation: %s\n", stim))
+
+  screening_results <- bind_rows(lapply(cytokine_cols, function(cyt) {
+    screen_lme(
+      data          = data_long,
+      cytokine_name = cyt,
+      stimulation   = stim,
+      covariates    = covariates,
+      min_obs       = 10,
+      min_subjects  = 5
+    )
+  }))
+
+  if (nrow(screening_results) == 0) {
+    cat(sprintf("  No results for %s. Skipping.\n", stim))
+    next
+  }
+
+  cat(sprintf("  Cytokines screened: %d\n", nrow(screening_results)))
+
+  screening_results <- screening_results %>%
+    mutate(
+      Visit_p_adj       = p.adjust(Visit_p,       method = "fdr"),
+      Age_p_adj         = p.adjust(Age_p,         method = "fdr"),
+      Interaction_p_adj = p.adjust(Interaction_p, method = "fdr"),
+      Visit_sig         = Visit_p_adj       < 0.05,
+      Age_sig           = Age_p_adj         < 0.05,
+      Interaction_sig   = Interaction_p_adj < 0.05,
+      Any_sig           = Visit_sig | Age_sig | Interaction_sig
+    ) %>%
+    arrange(Interaction_p_adj)
+
+  cat(sprintf(
+    "  FDR-significant: Visit = %d | Age = %d | Interaction = %d\n",
+    sum(screening_results$Visit_sig,       na.rm = TRUE),
+    sum(screening_results$Age_sig,         na.rm = TRUE),
+    sum(screening_results$Interaction_sig, na.rm = TRUE)
+  ))
+
+  write_xlsx(screening_results, file.path(out_dir, "LME_screening_results.xlsx"))
+
+  for (cyt in cytokine_cols) {
+    plot_lme(
+      data          = data_long,
+      cytokine_name = cyt,
+      stimulation   = stim,
+      visit_colors  = visit_colors,
+      covariates    = covariates,
+      save_path     = out_dir
+    )
+  }
+
+  summary_table <- screening_results %>%
+    select(
+      Cytokine, Stimulation, N_obs, N_subjects,
+      Visit_p, Visit_p_adj, Visit_sig,
+      Age_p, Age_p_adj, Age_sig,
+      Interaction_p, Interaction_p_adj, Interaction_sig, Any_sig
+    )
+
+  write_xlsx(summary_table, file.path(out_dir, "LME_summary_table.xlsx"))
+
+  all_analyses[[stim]] <- list(
+    screening_results = screening_results,
+    cytokines_plotted = cytokine_cols
+  )
+}
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```

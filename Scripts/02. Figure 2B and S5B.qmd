@@ -1,0 +1,291 @@
+---
+title: "Figures 2B and S5B"
+subtitle: "Box plots of cytokine changes following successful treatment (pairwise Wilcoxon test with FDR adjustment)"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+This document generates box plots of cytokine concentrations measured at each
+treatment visit in patients with successful treatment outcome (n=33). Visits
+are compared pairwise using the Wilcoxon test with FDR adjustment.
+
+Figure 2B shows results for cytokines shortlisted by Random Forest with highest AUCs.
+Figure S5B shows results for the rest of significantly changed cytokines following successful treatment.
+
+# Load Packages
+
+```{r}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(DataExplorer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)       
+```
+
+# Define File Paths
+
+```{r}
+input_file  <- "Input/Cytokines_cleaned_log10_Predict-TB.xlsx"
+
+output_fig2b_s5b  <- "Output/02. Figure_2B_S5B"
+output_fig2b_s5b_null  <- "Output/02. Figure_2B_S5B/Null"
+output_fig2b_s5b_mtb_ag  <- "Output/02. Figure_2B_S5B/Mtb_Ag"
+output_fig2b_s5b_lps  <- "Output/02. Figure_2B_S5B/LPS"
+output_fig2b_s5b_il1b  <- "Output/02. Figure_2B_S5B/IL1B"
+
+dir.create(output_fig2b_s5b,  recursive = TRUE, showWarnings = FALSE)
+dir.create(output_fig2b_s5b_null,  recursive = TRUE, showWarnings = FALSE)
+dir.create(output_fig2b_s5b_mtb_ag,  recursive = TRUE, showWarnings = FALSE)
+dir.create(output_fig2b_s5b_lps,  recursive = TRUE, showWarnings = FALSE)
+dir.create(output_fig2b_s5b_il1b,  recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Filter to successful treatment outcome
+
+```{r}
+protein_data <- all_data %>%
+  filter(Comments == "success") 
+```
+
+# Define cytokine columns
+
+```{r}
+cytokine_cols <- c(
+  "BDNF", "CCL11", "Factor_VII", "ICAM_1",
+  "IL_1_alpha", "IL_1_beta", "IL_10", "IL_12p40",
+  "IL_12p70", "IL_18", "IL_1RA", "IL_3", "IL_4",
+  "IL_6", "IL_7", "IL_8", "CCL2", "CCL3",
+  "MMP_3", "TNF", "VEGF", "IFNG", "IL_2",
+  "pan_IFNA", "IFNB"
+)
+```
+
+# Box Plot Function
+
+```{r}
+plot_cytokine <- function(data,
+                          cytokine_name,
+                          condition_filter = NULL,
+                          visit_comparisons = list(
+                            c("0", "16"), c("0", "24"), c("0", "72"),
+                            c("16", "24"), c("16", "72"), c("24", "72")
+                          ),
+                          save_path  = NULL,
+                          plot_width  = 3.5,
+                          plot_height = 5) {
+
+
+  if (!is.null(condition_filter)) {
+    data <- data %>% filter(Condition %in% condition_filter)
+  }
+
+  plot_data <- data %>%
+    select(ID1, Visit, Condition, all_of(cytokine_name)) %>%
+    mutate(Visit = as.factor(Visit))
+
+  p <- ggplot(plot_data, aes(x = Visit, y = .data[[cytokine_name]])) +
+    geom_boxplot(outlier.shape = 16, outlier.size = 1) +
+    geom_jitter(position = position_jitter(width = 0.08), size = 1) +
+    facet_grid(~ Condition) +
+    stat_compare_means(
+      comparisons       = visit_comparisons,
+      method            = "wilcox.test",
+      p.adjust.method = "fdr",
+      label             = "p.signif",
+      hide.ns           = FALSE
+    ) +
+    labs(
+      title = cytokine_name,
+      x     = "Visit (Week)",
+      y     = "Concentration (log10 pg/mL)"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      panel.border     = element_rect(color = "black", fill = NA),
+      strip.text.x     = element_text(size = 14),
+      strip.background = element_rect(fill = "grey80", color = "black")
+)
+
+  print(p)
+
+  if (!is.null(save_path)) {
+    ggsave(
+      filename = file.path(
+        save_path,
+        paste0(cytokine_name, "_boxplot",".png")
+      ),
+      plot   = p,
+      width  = plot_width,
+      height = plot_height,
+      units  = "in"
+    )
+  }
+
+  invisible(p)
+}
+```
+
+# Null condition
+
+```{r}
+for (cyt in cytokine_cols) {
+  plot_cytokine(
+    data             = protein_data,
+    cytokine_name    = cyt,
+    condition_filter = "Null",
+    save_path        = "Output/02. Figure_2B_S5B/Null/"
+  )
+}
+```
+---
+
+# Null-subtracted box plot function for other stimulation conditions
+
+```{r}
+# Use untransformed data here since stimulation condition requires subtraction by Null, then log10 transformation.
+protein_data_new <- protein_data %>%
+  mutate(across(all_of(cytokine_cols), ~ 10^.x))
+
+plot_cytokine_subtracted <- function(data,
+                                     cytokine_name,
+                                     condition_name,
+                                     visit_comparisons = list(
+                                       c("0", "16"), c("0", "24"), c("0", "72"),
+                                       c("16", "24"), c("16", "72"), c("24", "72")
+                                     ),
+                                     save_path   = NULL,
+                                     plot_width  = 3.5,
+                                     plot_height = 5) {
+
+  reference <- data %>%
+    filter(Condition == "Null") %>%
+    select(ID1, Visit, Reference = all_of(cytokine_name))
+
+  plot_data <- data %>%
+    filter(Condition == condition_name) %>%
+    select(ID1, Visit, Condition, all_of(cytokine_name)) %>%
+    left_join(reference, by = c("ID1", "Visit")) %>%
+    mutate(
+      Subtracted       = pmax(.data[[cytokine_name]] - Reference, 0),
+      log10_Subtracted = log10(1 + Subtracted),
+      Visit            = as.factor(Visit)
+    )
+
+  p <- ggplot(plot_data, aes(x = Visit, y = log10_Subtracted)) +
+    geom_boxplot(outlier.shape = 16, outlier.size = 1) +
+    geom_jitter(position = position_jitter(width = 0.08), size = 1) +
+    facet_grid(~ Condition) +
+    stat_compare_means(
+      comparisons = visit_comparisons,
+      method      = "wilcox.test",
+      p.adjust.method = "fdr",
+      label       = "p.signif",
+      hide.ns     = FALSE
+    ) +
+    labs(
+      title = cytokine_name,
+      x     = "Visit (Week)",
+      y     = "Log10 subtracted concentration (pg/mL)"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      panel.border     = element_rect(color = "black", fill = NA),
+      strip.text.x     = element_text(size = 14),
+      strip.background = element_rect(fill = "grey80", color = "black")
+)
+
+  print(p)
+
+  if (!is.null(save_path)) {
+    ggsave(
+      filename = file.path(
+        save_path,
+        paste0(cytokine_name, "_", condition_name, "_subtracted_boxplot.png")
+      ),
+      plot   = p,
+      width  = plot_width,
+      height = plot_height,
+      units  = "in"
+    )
+  }
+
+  invisible(p)
+}
+```
+
+# Mtb_Ag (null-subtracted)
+
+```{r}
+for (cyt in cytokine_cols) {
+  plot_cytokine_subtracted(
+    data           = protein_data_new,
+    cytokine_name  = cyt,
+    condition_name = "Mtb_Ag",
+    save_path      = "Output/02. Figure_2B_S5B/Mtb_Ag/"
+  )
+}
+```
+
+# LPS (null-subtracted)
+
+```{r}
+for (cyt in cytokine_cols) {
+  plot_cytokine_subtracted(
+    data           = protein_data_new,
+    cytokine_name  = cyt,
+    condition_name = "LPS",
+    save_path      = "Output/02. Figure_2B_S5B/LPS/"
+  )
+}
+```
+
+# IL1B (null-subtracted)
+
+```{r}
+for (cyt in cytokine_cols) {
+  plot_cytokine_subtracted(
+    data           = protein_data_new,
+    cytokine_name  = cyt,
+    condition_name = "IL1B",
+    save_path      = "Output/02. Figure_2B_S5B/IL1B/"
+  )
+}
+```
+
+# Session Information
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```
