@@ -1,0 +1,506 @@
+---
+title: "Figures 4C and 4D"
+subtitle: "Linear mixed-effects models of protein biomarkers and treatment effect on lung lesion volumes"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+Figure 4C: linear mixed-effects model (LME) of protein biomarkers and treatment
+effect on total cavity volume (CAVTOT, mL).
+
+Figure 4D: linear mixed-effects model (LME) of protein biomarkers and treatment
+effect on total lesion glycolysis (TLG, mL).
+
+For each cytokine and outcome a model of the form
+`outcome ~ Visit * Cytokine + Age + Sex + Arm + (1|ID1)` is fitted. Age is
+included as a continuous covariate. Sex (Female, Male) and Arm (A, B, C)
+are included as categorical covariates. The interaction term tests whether the
+association between cytokine and lung lesions (outcome) differs between W0 and W16 after
+adjusting for these covariates. P-values are FDR-corrected across cytokines
+within each outcome.
+
+# Load packages
+
+```{r}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(DataExplorer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(car)
+library(emmeans)
+library(writexl)
+```
+
+# Define file paths
+
+```{r}
+input_file  <- "Input/Cytokines_cleaned_log10_Predict-TB.xlsx"
+input_pet   <- "Input/PET.CT_long_SATVI.xlsx"
+output_main <- "Output/04. Figure_4C_4D"
+
+dir.create(output_main, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+
+pet_data <- read_excel(input_pet, sheet = 1) %>%
+  select(ID1, Visit, CAVTOT, TLG) %>%
+  mutate(Visit = paste0("W", Visit))
+
+head(pet_data)
+dim(pet_data)
+```
+
+# Filter and recode
+
+Only the Null (unstimulated) condition is used. Visit W24 is excluded because
+imaging data are only available at W0 and W16.
+
+```{r}
+cytokine_data <- all_data %>%
+  filter(Comments == "success") %>%
+  mutate(
+    Condition = ifelse(Condition == "TB", "Mtb_Ag", Condition),
+    Visit     = paste0("W", Visit)
+  ) %>%
+  filter(Visit %in% c("W0", "W16"))
+
+cytokine_data <- cytokine_data %>%
+  mutate(
+    Age = as.numeric(Age),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Arm = factor(Arm, levels = c("A", "B", "C"))
+  )
+
+cat(sprintf("Rows: %d | Visits: %s\n",
+            nrow(cytokine_data),
+            paste(sort(unique(cytokine_data$Visit)), collapse = ", ")))
+```
+# Merge cytokine and PET/CT data
+
+```{r}
+cytokine_pet_data <- cytokine_data %>%
+  left_join(pet_data, by = c("ID1", "Visit"))
+```
+
+# Log transform imaging variables
+
+CAVTOT and TLG are log10(1 + x) transformed to handle zero values safely.
+
+```{r}
+cytokine_pet_data_log <- cytokine_pet_data %>%
+  mutate(
+    CAVTOT = log10(1 + CAVTOT),
+    TLG    = log10(1 + TLG)
+  )
+```
+
+# Define cytokine columns
+
+```{r}
+meta_cols <- c("ID1", "Visit", "Condition", "Comments",
+               "CAVTOT", "TLG", "Age", "Sex", "Arm")
+
+cytokine_cols <- c(
+  "BDNF", "CCL11", "Factor_VII", "ICAM_1",
+  "IL_1_alpha", "IL_1_beta", "IL_10", "IL_12p40",
+  "IL_12p70", "IL_18", "IL_1RA", "IL_3", "IL_4",
+  "IL_6", "IL_7", "IL_8", "CCL2", "CCL3",
+  "MMP_3", "TNF", "VEGF", "IFNG", "IL_2",
+  "pan_IFNA", "IFNB"
+)
+
+cat(sprintf("Cytokines retained: %d\n", length(cytokine_cols)))
+```
+
+# Reshape to long format
+
+Each row represents one cytokine measurement for one patient at one visit.
+
+```{r}
+data_long <- cytokine_pet_data_log %>%
+  pivot_longer(
+    cols      = all_of(cytokine_cols),
+    names_to  = "Cytokine",
+    values_to = "Cytokine_Value"
+  )
+
+cat(sprintf(
+  "Rows: %d | Cytokines: %d | Patients: %d\n",
+  nrow(data_long),
+  n_distinct(data_long$Cytokine),
+  n_distinct(data_long$ID1)
+))
+```
+
+# Analysis configuration
+
+```{r}
+analysis_config <- list(
+
+  CAVTOT = list(
+    outcome      = "CAVTOT",
+    label        = "Total cavity volume (log10 mL)",
+    min_obs      = 10,
+    min_subjects = 5
+  ),
+
+  TLG = list(
+    outcome      = "TLG",
+    label        = "Total lesion glycolysis (log10 mL)",
+    min_obs      = 10,
+    min_subjects = 5
+  )
+)
+```
+
+# Visit colours
+
+```{r}
+visit_colors <- c("W0" = "magenta", "W16" = "#00CCFF")
+```
+
+# LME screening function
+`screen_lme`: fits `outcome ~ Visit * Cytokine_Value + Age + Sex + Arm + (1|ID1)`
+for one cytokine and one outcome. Covariates are passed as a character vector
+and added to the formula dynamically. Returns Wald chi-square p-values for the
+Visit main effect, cytokine main effect, and interaction. Returns NULL if data
+are insufficient.
+
+```{r}
+screen_lme <- function(data, cytokine_name, outcome,
+                       stimulation  = NULL,
+                       covariates   = NULL,
+                       min_obs      = 10,
+                       min_subjects = 5) {
+
+  dat <- data %>%
+    filter(
+      Cytokine == cytokine_name,
+      !is.na(.data[[outcome]]),
+      !is.na(Cytokine_Value)
+    )
+
+  if (!is.null(stimulation)) {
+    dat <- dat %>% filter(Condition == stimulation)
+  }
+
+  dat <- dat %>%
+    mutate(
+      ID1   = as.factor(ID1),
+      Visit = factor(Visit, levels = c("W0", "W16"))
+    )
+
+  if (nrow(dat) < min_obs || n_distinct(dat$ID1) < min_subjects) return(NULL)
+
+  covariate_terms <- if (!is.null(covariates)) paste(covariates, collapse = " + ") else NULL
+  formula_str     <- paste(
+    outcome, "~ Visit * Cytokine_Value",
+    if (!is.null(covariate_terms)) paste("+", covariate_terms),
+    "+ (1|ID1)"
+  )
+
+  tryCatch({
+    model     <- lmer(as.formula(formula_str), data = dat, REML = FALSE)
+    anova_res <- Anova(model, type = 3)
+
+    data.frame(
+      Cytokine      = cytokine_name,
+      Stimulation   = if (!is.null(stimulation)) stimulation else "All",
+      Visit_p       = anova_res["Visit",                "Pr(>Chisq)"],
+      Cytokine_p    = anova_res["Cytokine_Value",       "Pr(>Chisq)"],
+      Interaction_p = anova_res["Visit:Cytokine_Value", "Pr(>Chisq)"],
+      N_obs         = nrow(dat),
+      N_subjects    = n_distinct(dat$ID1),
+      stringsAsFactors = FALSE
+    )
+  }, error = function(e) {
+    message("LME failed for ", cytokine_name, " | ", stimulation, ": ", e$message)
+    NULL
+  })
+}
+```
+
+# P-value formatting helper
+
+```{r}
+format_p <- function(p) {
+  stars <- if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else ""
+  label <- if (p < 0.001) "p < 0.001" else sprintf("p = %.3f", p)
+  paste0(label, stars)
+}
+```
+
+# LME plot function
+ `plot_lme`: fits the same model as `screen_lme` and generates a scatter plot with LME-predicted regression lines per visit and 95% confidence bands from emmeans, adjusted to the mean values of Age, Sex, and Arm. Raw p-values with significance stars are shown in the subtitle. Regression equations for W0 and W16 are annotated in the top right corner of the plot.
+
+```{r}
+plot_lme <- function(data, cytokine_name, outcome, outcome_label,
+                     visit_colors, stimulation = NULL,
+                     covariates = NULL, save_path = NULL) {
+
+  dat <- data %>%
+    filter(
+      Cytokine == cytokine_name,
+      !is.na(.data[[outcome]]),
+      !is.na(Cytokine_Value)
+    )
+
+  if (!is.null(stimulation)) {
+    dat <- dat %>% filter(Condition == stimulation)
+  }
+
+  dat <- dat %>%
+    mutate(
+      ID1   = as.factor(ID1),
+      Visit = factor(Visit, levels = c("W0", "W16"))
+    )
+
+  if (nrow(dat) < 10 || n_distinct(dat$ID1) < 5) return(invisible(NULL))
+
+  covariate_terms <- if (!is.null(covariates)) paste(covariates, collapse = " + ") else NULL
+  formula_str     <- paste(
+    outcome, "~ Visit * Cytokine_Value",
+    if (!is.null(covariate_terms)) paste("+", covariate_terms),
+    "+ (1|ID1)"
+  )
+
+  model <- tryCatch(
+    lmer(as.formula(formula_str), data = dat, REML = FALSE),
+    error = function(e) NULL
+  )
+
+  if (is.null(model)) return(invisible(NULL))
+
+  anova_res     <- Anova(model, type = 3)
+  visit_p       <- anova_res["Visit",                "Pr(>Chisq)"]
+  cytokine_p    <- anova_res["Cytokine_Value",       "Pr(>Chisq)"]
+  interaction_p <- anova_res["Visit:Cytokine_Value", "Pr(>Chisq)"]
+
+  cyt_seq <- seq(
+    min(dat$Cytokine_Value, na.rm = TRUE),
+    max(dat$Cytokine_Value, na.rm = TRUE),
+    length.out = 50
+  )
+
+  pred <- as.data.frame(
+    emmeans(model, ~ Visit * Cytokine_Value,
+            at = list(Cytokine_Value = cyt_seq))
+  )
+
+  coefs         <- fixef(model)
+  intercept_w0  <- coefs["(Intercept)"]
+  slope_w0      <- coefs["Cytokine_Value"]
+  intercept_w16 <- intercept_w0 +
+    ifelse("VisitW16" %in% names(coefs), coefs["VisitW16"], 0)
+  slope_w16 <- slope_w0 +
+    ifelse("VisitW16:Cytokine_Value" %in% names(coefs),
+           coefs["VisitW16:Cytokine_Value"], 0)
+
+  eq_label <- paste0(
+    sprintf("W0:  y = %.3fx %s %.3f",
+            slope_w0,  ifelse(intercept_w0  >= 0, "+", "-"), abs(intercept_w0)),
+    "\n",
+    sprintf("W16: y = %.3fx %s %.3f",
+            slope_w16, ifelse(intercept_w16 >= 0, "+", "-"), abs(intercept_w16))
+  )
+
+  stim_label <- if (!is.null(stimulation)) stimulation else "All conditions"
+
+  x_unit <- if (cytokine_name == "pan_IFNA") "log10 fg/mL" else "log10 pg/mL"
+
+p <- ggplot() +
+    geom_ribbon(
+      data = pred,
+      aes(x = Cytokine_Value, ymin = lower.CL, ymax = upper.CL, fill = Visit),
+      alpha = 0.2
+    ) +
+    geom_line(
+      data = pred,
+      aes(x = Cytokine_Value, y = emmean, color = Visit),
+      linewidth = 1.5
+    ) +
+    geom_point(
+      data = dat,
+      aes(x = Cytokine_Value, y = .data[[outcome]], color = Visit),
+      alpha = 0.6, size = 2.5
+    ) +
+    annotate(
+      "text",
+      x = Inf, y = Inf, label = eq_label,
+      hjust = 1.05, vjust = 1.5, size = 3.2,
+      fontface = "italic", color = "gray30"
+    ) +
+    scale_color_manual(values = visit_colors, name = "Visit") +
+    scale_fill_manual(values  = visit_colors, name = "Visit") +
+    labs(
+      title    = paste0(cytokine_name, "  (", stim_label, ")"),
+      subtitle = paste0(
+        "Visit: ",       format_p(visit_p),       "  |  ",
+        "Cytokine: ",    format_p(cytokine_p),    "  |  ",
+        "Interaction: ", format_p(interaction_p)
+      ),
+      x       = paste0(cytokine_name, " (", x_unit, ")"),
+      y       = outcome_label,
+      caption = paste0(
+        "LME: outcome ~ Visit * Cytokine",
+        if (!is.null(covariates)) paste0(" + ", paste(covariates, collapse = " + ")),
+        " + (1|ID1)"
+      )
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      legend.position = "top",
+      plot.title      = element_text(face = "bold"),
+      plot.subtitle   = element_text(size = 9, color = "gray40"),
+      panel.border    = element_rect(color = "black", fill = NA)
+    )
+
+  print(p)
+
+  if (!is.null(save_path)) {
+    ggsave(
+      file.path(
+        save_path,
+        paste0(cytokine_name, "_", stim_label, "_LME_", outcome, ".pdf")
+      ),
+      plot = p, width = 8, height = 6, units = "in"
+    )
+  }
+
+  invisible(p)
+}
+```
+
+# Run all analyses
+
+For each outcome, all cytokines are screened. FDR correction is applied across
+cytokines. Cytokines with a significant FDR-corrected interaction (p < 0.05)
+are plotted. If no cytokines reach FDR significance, the top 10 by raw
+interaction p-value are plotted instead.
+
+```{r}
+all_analyses <- list()
+stimulations <- c("Null", "Mtb_Ag", "LPS", "IL1B")
+covariates   <- c("Age", "Sex", "Arm")
+
+for (analysis_name in names(analysis_config)) {
+  config <- analysis_config[[analysis_name]]
+
+  for (stim in stimulations) {
+    out_dir <- file.path(output_main, analysis_name, stim)
+    dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+    cat(sprintf("  Stimulation: %s\n", stim))
+
+    screening_results <- bind_rows(lapply(cytokine_cols, function(cyt) {
+      screen_lme(
+        data          = data_long,
+        cytokine_name = cyt,
+        outcome       = config$outcome,
+        stimulation   = stim,
+        covariates    = covariates,
+        min_obs       = config$min_obs,
+        min_subjects  = config$min_subjects
+      )
+    }))
+
+    if (nrow(screening_results) == 0) {
+      cat(sprintf("  No results for %s | %s. Skipping.\n", stim, config$outcome))
+      next
+    }
+
+    cat(sprintf("  Cytokines screened: %d\n", nrow(screening_results)))
+
+    screening_results <- screening_results %>%
+      mutate(
+        Visit_p_adj       = p.adjust(Visit_p,       method = "fdr"),
+        Cytokine_p_adj    = p.adjust(Cytokine_p,    method = "fdr"),
+        Interaction_p_adj = p.adjust(Interaction_p, method = "fdr"),
+        Visit_sig         = Visit_p_adj       < 0.05,
+        Cytokine_sig      = Cytokine_p_adj    < 0.05,
+        Interaction_sig   = Interaction_p_adj < 0.05,
+        Any_sig           = Visit_sig | Cytokine_sig | Interaction_sig
+      ) %>%
+      arrange(Interaction_p_adj)
+
+    cat(sprintf(
+      "  FDR-significant: Visit = %d | Cytokine = %d | Interaction = %d\n",
+      sum(screening_results$Visit_sig,       na.rm = TRUE),
+      sum(screening_results$Cytokine_sig,    na.rm = TRUE),
+      sum(screening_results$Interaction_sig, na.rm = TRUE)
+    ))
+
+    write_xlsx(screening_results, file.path(out_dir, "LME_screening_results.xlsx"))
+
+    cytokines_to_plot <- screening_results %>% filter(Interaction_sig)
+
+    if (nrow(cytokines_to_plot) == 0) {
+      cat("  No FDR-significant interactions. Plotting top 10 by raw p-value.\n")
+      cytokines_to_plot <- head(screening_results, 10)
+    }
+
+    cat(sprintf("  Cytokines to plot: %d\n", nrow(cytokines_to_plot)))
+
+    for (cyt in cytokines_to_plot$Cytokine) {
+      plot_lme(
+        data          = data_long,
+        cytokine_name = cyt,
+        outcome       = config$outcome,
+        outcome_label = config$label,
+        visit_colors  = visit_colors,
+        stimulation   = stim,
+        covariates    = covariates,
+        save_path     = out_dir
+      )
+    }
+
+    summary_table <- screening_results %>%
+      select(
+        Cytokine, Stimulation, N_obs, N_subjects,
+        Visit_p, Visit_p_adj, Visit_sig,
+        Cytokine_p, Cytokine_p_adj, Cytokine_sig,
+        Interaction_p, Interaction_p_adj, Interaction_sig, Any_sig
+      )
+
+    write_xlsx(summary_table, file.path(out_dir, "LME_summary_table.xlsx"))
+
+    all_analyses[[paste0(analysis_name, "_", stim)]] <- list(
+      screening_results = screening_results,
+      cytokines_plotted = cytokines_to_plot$Cytokine
+    )
+  }
+}
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```

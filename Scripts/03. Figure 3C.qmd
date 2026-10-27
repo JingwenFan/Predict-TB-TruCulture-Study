@@ -1,0 +1,850 @@
+---
+title: "Figure 3C"
+subtitle: "GSEA for gene signatures significantly changed between W0 and W16 in the treatment successful group (Figure 3C)"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Figure 3C: pathway activity changes between W0 and W16 in patients with
+successful treatment outcome, adjusted for Age, Sex, and trial Arm. 
+Cross-validation by NanoTube and PLAGE.
+
+NanoTube `limmaToFGSEA` with a combined gene set of NanoString panel annotations
+and the Hallmark collection is the primary analysis. NanoString panel annotations
+capture the immune biology curated specifically for this panel. The Hallmark
+collection is added to cover the 30 additional customised genes in this panel
+that extend beyond the standard NanoString pathway annotations. Because Age, Sex,
+and trial Arm are patient-level variables that are collinear with the donor
+blocking factor in a paired design, their effects are removed by residualising
+gene expression within each stimulation condition prior to analysis. Genes are
+then ranked by the limma paired t-statistic from a model of the form
+`residualised expression ~ Donor + Visit`. Significant pathways are defined as
+FDR < 0.01. Results are clustered by leading edge similarity.
+
+PLAGE with the combined NanoString and Hallmark pathway set is used for
+validation. It computes a per-sample pathway activity score using the first
+principal component of the residualised pathway gene expression matrix, then
+tests the score with a paired t-test matched by donor. Because PLAGE uses a
+fundamentally different algorithm it provides independent confirmation of the
+primary results. Pathways that are significant in both analyses are considered
+the most robust findings and reported in the manuscript.
+
+# Load packages
+
+```{r}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(readr)
+library(DataExplorer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(limma)
+library(fgsea)
+library(msigdbr)
+library(writexl)
+library(Biobase)
+library(NanoTube)
+```
+
+# Define file paths
+
+```{r}
+input_file   <- "Input/Nanostring_Wide_log2_normalised.xlsx"
+input_annot  <- "Input/NanoString_ProbeAnnotations_NS_Hs_HostResponse_v1.1_panel.csv"
+output_fig3c <- "Output/03. Figure_3C"
+output_gsea  <- file.path(output_fig3c, "GSEA_NanoTube_primary")
+output_plage <- file.path(output_fig3c, "PLAGE_validation")
+output_limma <- file.path(output_fig3c, "Limma")
+
+for (d in c(output_fig3c, output_gsea, output_plage, output_limma)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# Load data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Filter and recode
+
+One barcode (0408230288) is excluded as a quality control outlier. Stimulation
+labels are standardised to match the protein data naming convention.
+
+```{r}
+nano_data <- all_data %>%
+  filter(Comments == "success") %>%
+  mutate(
+    Stimulation = ifelse(Stimulation == "TB",   "Mtb_Ag", Stimulation),
+    Stimulation = ifelse(Stimulation == "NULL", "Null",   Stimulation),
+    Visit       = paste0("W", Visit)
+  ) %>%
+  filter(!Barcode %in% "0408230288") %>%
+  select(-Barcode)
+
+cat(sprintf("Rows: %d | Columns: %d\n", nrow(nano_data), ncol(nano_data)))
+cat(sprintf("Visits: %s\n",       paste(unique(nano_data$Visit),       collapse = ", ")))
+cat(sprintf("Stimulations: %s\n", paste(unique(nano_data$Stimulation), collapse = ", ")))
+
+# Define covariates
+nano_data <- nano_data %>%
+  mutate(
+    Age = as.numeric(Age),
+    Sex = factor(Sex, levels = c("Female", "Male")),
+    Arm = factor(Arm, levels = c("A", "B", "C"))
+  )
+
+cat(sprintf("Covariate check - Age range: %.0f - %.0f | Sex levels: %s | Arm levels: %s\n",
+            min(nano_data$Age, na.rm = TRUE),
+            max(nano_data$Age, na.rm = TRUE),
+            paste(levels(nano_data$Sex), collapse = ", "),
+            paste(levels(nano_data$Arm), collapse = ", ")))
+```
+
+# Data overview
+
+```{r}
+plot_intro(nano_data)
+```
+
+# Define gene columns
+
+Gene columns run from ACE to TBP. A guard check stops the document if either
+boundary column is missing.
+
+```{r}
+col_start <- which(names(nano_data) == "ACE")
+col_end   <- which(names(nano_data) == "TBP")
+
+if (length(col_start) == 0 || length(col_end) == 0) {
+  stop("ACE or TBP not found in nano_data. Check column names.")
+}
+
+gene_cols <- names(nano_data)[col_start:col_end]
+
+cat(sprintf(
+  "First gene: %s | Last gene: %s | Total: %d\n",
+  names(nano_data)[col_start],
+  names(nano_data)[col_end],
+  length(gene_cols)
+))
+```
+
+# Load NanoString pathway annotations
+
+The NanoString immune panel includes its own pathway annotations for each probe.
+The annotation column uses :: as a separator between multiple pathway assignments.
+
+```{r}
+probe_annot <- read_csv(input_annot, show_col_types = FALSE)
+
+nanostring_pathway_df <- probe_annot %>%
+  filter(Is.Control == 0,
+         !is.na(Probe.Annotation),
+         Probe.Annotation != "") %>%
+  select(Gene = Probe.Label, Pathway = Probe.Annotation) %>%
+  separate_rows(Pathway, sep = "::") %>%
+  filter(!is.na(Pathway), Pathway != "")
+
+nanostring_pathways <- split(nanostring_pathway_df$Gene,
+                             nanostring_pathway_df$Pathway)
+
+cat(sprintf("NanoString-defined pathways: %d\n", length(nanostring_pathways)))
+
+pathway_coverage <- sapply(nanostring_pathways, function(g) sum(g %in% gene_cols))
+
+cat(sprintf(
+  "Pathways with at least 3 genes measured: %d / %d\n",
+  sum(pathway_coverage >= 3),
+  length(nanostring_pathways)
+))
+```
+
+# Load Hallmark gene sets
+
+Only Hallmark gene sets with at least 3 genes measured in this panel are
+retained to avoid testing pathways with minimal representation.
+
+```{r}
+hallmark <- msigdbr(species = "Homo sapiens", collection = "H") %>%
+  select(gs_name, gene_symbol)
+
+hallmark_list <- split(hallmark$gene_symbol, hallmark$gs_name)
+
+hallmark_filtered <- hallmark_list[
+  sapply(hallmark_list, function(g) sum(g %in% gene_cols) >= 3)
+]
+
+cat(sprintf(
+  "Hallmark gene sets with at least 3 genes measured: %d / %d\n",
+  length(hallmark_filtered),
+  length(hallmark_list)
+))
+```
+
+# Build combined pathway set
+
+NanoString panel annotations are merged with the filtered Hallmark collection.
+Duplicate names are removed.
+
+```{r}
+combined_pathways <- c(nanostring_pathways, hallmark_filtered)
+combined_pathways <- combined_pathways[!duplicated(names(combined_pathways))]
+
+cat(sprintf(
+  "Combined pathway set: %d NanoString + %d Hallmark = %d total\n",
+  length(nanostring_pathways),
+  length(hallmark_filtered),
+  length(combined_pathways)
+))
+```
+# Residualise expression against covariates
+
+Age, Sex, and Arm cannot be included directly in the paired design matrix because
+they are patient-level variables that are collinear with the Donor blocking factor.
+Instead, the effect of these covariates is removed from gene expression values
+before the paired analysis. Residualisation is performed separately within each
+stimulation condition. The residuals carry the covariate-adjusted variation and
+are used in all downstream analyses.
+
+```{r}
+residualise_expression <- function(data, gene_cols,
+                                   covariates = c("Age", "Sex", "Arm")) {
+
+  data %>%
+    group_by(Stimulation) %>%
+    group_modify(function(stim_data, key) {
+
+      missing_cov <- sum(!complete.cases(stim_data[, covariates, drop = FALSE]))
+      if (missing_cov > 0) {
+        cat(sprintf("  Warning: %d rows with missing covariate values in %s\n",
+                    missing_cov, key$Stimulation))
+      }
+
+      cov_formula <- as.formula(paste("gene_val ~", paste(covariates, collapse = " + ")))
+
+      for (gene in gene_cols) {
+        fit_data        <- stim_data
+        fit_data$gene_val <- stim_data[[gene]]
+
+        fit <- tryCatch(
+          lm(cov_formula, data = fit_data),
+          error = function(e) NULL
+        )
+
+        if (!is.null(fit)) {
+          stim_data[[gene]] <- residuals(fit)
+        }
+      }
+      stim_data
+    }) %>%
+    ungroup()
+}
+
+nano_data_resid <- residualise_expression(nano_data, gene_cols)
+
+cat(sprintf(
+  "Residualised dataset: %d rows | %d columns\n",
+  nrow(nano_data_resid), ncol(nano_data_resid)
+))
+
+```
+
+
+# limma paired analysis
+
+`prepare_limma_data`: filters to a given stimulation and visit pair, identifies
+paired donors, and returns a genes-by-samples expression matrix for limma.
+
+```{r}
+prepare_limma_data <- function(data, stimulation, gene_cols,
+                               visit_pair = c("W0", "W16")) {
+
+  stim_data <- data %>%
+    filter(Stimulation == stimulation, Visit %in% visit_pair)
+
+  paired_donors <- stim_data %>%
+    group_by(Donor) %>%
+    summarise(
+      has_W0  = any(Visit == "W0"),
+      has_W16 = any(Visit == "W16"),
+      .groups = "drop"
+    ) %>%
+    filter(has_W0 & has_W16) %>%
+    pull(Donor)
+
+  cat(sprintf("  %s: %d paired donors\n", stimulation, length(paired_donors)))
+
+  if (length(paired_donors) < 3) {
+    cat(sprintf("  Skipping %s: fewer than 3 paired donors\n", stimulation))
+    return(NULL)
+  }
+
+  paired_data <- stim_data %>%
+    filter(Donor %in% paired_donors) %>%
+    arrange(Donor, Visit)
+
+  expr_matrix <- paired_data %>%
+    select(all_of(gene_cols)) %>%
+    t()
+
+  colnames(expr_matrix) <- paste(paired_data$Donor, paired_data$Visit, sep = "_")
+
+  metadata <- data.frame(
+    Sample = colnames(expr_matrix),
+    Donor  = factor(paired_data$Donor),
+    Visit  = factor(paired_data$Visit, levels = visit_pair),
+    stringsAsFactors = FALSE
+  )
+
+  cat(sprintf("  Expression matrix: %d genes x %d samples\n",
+              nrow(expr_matrix), ncol(expr_matrix)))
+
+  list(expr_matrix = expr_matrix, metadata = metadata,
+       n_donors = length(paired_donors))
+}
+```
+
+# Run limma for all stimulations
+
+Limma results and ranked gene lists are saved and used by both NanoTube and
+PLAGE.
+
+```{r}
+stimulations  <- unique(nano_data$Stimulation)
+limma_fits    <- list()
+limma_data    <- list()
+limma_results <- list()
+
+for (stim in stimulations) {
+  data_prep <- prepare_limma_data(nano_data_resid, stim, gene_cols)
+
+  if (is.null(data_prep)) next
+
+  design  <- model.matrix(~ Donor + Visit, data = data_prep$metadata)
+  fit     <- lmFit(data_prep$expr_matrix, design)
+  fit     <- eBayes(fit)
+  limma_fits[[stim]] <- fit
+  results <- topTable(fit, coef = "VisitW16", number = Inf, sort.by = "none")
+  results$Gene <- rownames(results)
+
+  ranked_genes <- sort(setNames(results$t, results$Gene), decreasing = TRUE)
+
+  cat(sprintf(
+    "  %s: %d genes | FDR < 0.01: %d\n | t range: [%.2f, %.2f]\n",
+    stim, nrow(results),
+    sum(results$adj.P.Val < 0.01, na.rm = TRUE),
+    min(results$t), max(results$t)
+  ))
+
+  limma_data[[stim]]    <- data_prep
+  limma_results[[stim]] <- list(ranked_genes = ranked_genes, results = results)
+
+  write_xlsx(
+    results %>%
+      arrange(desc(abs(t))) %>%
+      select(Gene, logFC, AveExpr, t, P.Value, adj.P.Val, B),
+    file.path(output_limma, paste0(stim, "_limma_results.xlsx"))
+  )
+
+  write_xlsx(
+    data.frame(
+      Gene        = names(ranked_genes),
+      t_statistic = as.numeric(ranked_genes),
+      Rank        = seq_along(ranked_genes),
+      stringsAsFactors = FALSE
+    ),
+    file.path(output_limma, paste0(stim, "_ranked_genes.xlsx"))
+  )
+}
+
+cat(sprintf(
+  "limma complete for %d stimulations: %s\n",
+  length(limma_results),
+  paste(names(limma_results), collapse = ", ")
+))
+```
+
+# NanoTube GSEA with combined pathway set (primary analysis)
+
+For each stimulation, a paired design matrix is passed to `runLimmaAnalysis`.
+`limmaToFGSEA` is called with the combined NanoString and Hallmark pathway set.
+Results are clustered by leading edge similarity and saved to Excel.
+
+```{r}
+nanotube_gsea_results <- list()
+
+for (stim in names(limma_fits)) {
+
+  cat(sprintf("\nNanoTube GSEA (primary): %s\n", stim))
+
+  gsea_res <- tryCatch(
+    limmaToFGSEA(
+      limmaResults = limma_fits[[stim]],
+      gene.sets    = combined_pathways,
+      min.set      = 3,
+      rank.by      = "t",
+      skip.first   = TRUE
+    ),
+    error = function(e) { message("GSEA failed: ", e$message); NULL }
+  )
+
+  if (is.null(gsea_res)) next
+
+  nanotube_gsea_results[[stim]] <- list(
+    limma = limma_fits[[stim]],
+    gsea  = gsea_res
+  )
+
+  # gsea_res is a named list with one entry per design matrix coefficient.
+  # We access the VisitW16 entry which holds the treatment effect results.
+  if (is.null(gsea_res[["VisitW16"]])) {
+    cat(sprintf("  VisitW16 coefficient not found for %s. Check design matrix.\n", stim))
+    next
+  }
+
+  l_edge <- tryCatch(
+    fgseaToLEdge(
+      gsea_res[["VisitW16"]],
+      cutoff.type = "padj",
+      cutoff      = 0.01
+    ),
+    error = function(e) NULL
+  )
+
+  if (!is.null(l_edge)) {
+    out_file <- file.path(output_gsea,
+                          paste0("NanoTube_GSEA_", stim, ".xlsx"))
+    tryCatch(
+      fgseaPostprocessingXLSX(
+        genesetResults = gsea_res[["VisitW16"]],
+        leadingEdge    = l_edge,
+        limmaResults   = limma_fits[[stim]],
+        join.threshold = 0.5,
+        filename       = out_file
+      ),
+      error = function(e) message("Postprocessing failed: ", e$message)
+    )
+    cat(sprintf("  Saved: %s\n", basename(out_file)))
+  }
+
+  n_sig <- sum(!is.na(gsea_res[["VisitW16"]]$padj) &
+                 gsea_res[["VisitW16"]]$padj < 0.01, na.rm = TRUE)
+  cat(sprintf("  Significant pathways (FDR < 0.01): %d\n", n_sig))
+}
+```
+
+# Combine NanoTube significant results
+
+```{r}
+nanotube_sig <- bind_rows(lapply(names(nanotube_gsea_results), function(stim) {
+  res <- nanotube_gsea_results[[stim]]$gsea[["VisitW16"]]
+  if (is.null(res)) return(NULL)
+  res %>%
+    filter(!is.na(padj), padj < 0.01) %>%
+    mutate(Stimulation = stim)
+}))
+
+cat(sprintf("Total significant pathways (FDR < 0.01): %d\n", nrow(nanotube_sig)))
+
+nanotube_sig %>%
+  group_by(Stimulation) %>%
+  summarise(
+    N_pathways   = n(),
+    N_higher_W16 = sum(NES > 0),
+    N_higher_W0  = sum(NES < 0),
+    .groups      = "drop"
+  )
+
+nanotube_sig %>%
+  mutate(leadingEdge = sapply(leadingEdge, paste, collapse = ";")) %>%
+  write_xlsx(file.path(output_gsea, "Significant_pathways_all_stim.xlsx"))
+```
+
+# NanoTube bubble plot
+
+Pathways are ordered by ascending FDR. Hallmark pathway names are prefixed with
+Hallmark to distinguish them from NanoString panel annotations.
+
+```{r}
+#| fig-width: 12
+#| fig-height: 6
+
+if (nrow(nanotube_sig) > 0) {
+
+  nanotube_sig_plot <- nanotube_sig %>%
+    mutate(
+      pathway_short = ifelse(
+        grepl("^HALLMARK_", pathway),
+        paste0("Hallmark: ", gsub("_", " ", gsub("^HALLMARK_", "", pathway))),
+        gsub("_", " ", pathway)
+      ),
+      Stimulation = factor(Stimulation,
+                           levels = c("Null", "Mtb_Ag", "LPS", "IL1B"))
+    )
+
+  pathway_order_nt <- nanotube_sig_plot %>%
+    arrange(padj) %>%
+    pull(pathway_short) %>%
+    unique()
+
+  nanotube_sig_plot <- nanotube_sig_plot %>%
+    mutate(pathway_short = factor(pathway_short, levels = pathway_order_nt))
+
+  p_3c <- ggplot(
+      nanotube_sig_plot,
+      aes(x = pathway_short, y = Stimulation,
+          size = -log10(padj), color = NES)
+    ) +
+    geom_point(alpha = 0.8) +
+    scale_color_gradient2(
+      low      = "blue",
+      mid      = "white",
+      high     = "red",
+      midpoint = 0,
+      name     = "NES"
+    ) +
+    scale_size_continuous(range = c(3, 10), name = "-log10(FDR)") +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_discrete(drop = FALSE) +
+    labs(
+      title    = "Pathway enrichment: W16 vs W0",
+      subtitle = "NanoString panel annotations and Hallmark | Paired limma, FDR < 0.01 | Red: higher at W16 | Blue: higher at W0",
+      x        = "Pathway",
+      y        = "Stimulation"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x      = element_text(angle = 45, hjust = 1, color = "black", size = 9),
+      axis.text.y      = element_text(color = "black"),
+      panel.grid.major = element_line(color = "gray90"),
+      legend.position  = "right"
+    )
+
+  print(p_3c)
+
+  ggsave(
+    file.path(output_fig3c, "3C_NanoTube_bubble_plot.pdf"),
+    plot   = p_3c,
+    width  = 12,
+    height = 6,
+    units  = "in"
+  )
+}
+```
+
+# PLAGE validation function
+
+`run_plage_paired`: for each pathway, the expression matrix of pathway genes is
+mean-centred and decomposed by SVD. The first right singular vector gives a
+pathway activity score per sample. The sign is corrected so that a higher score
+corresponds to higher mean pathway expression. A paired t-test compares W0 and
+W16 scores matched by donor. PLAGE uses combined NanoString and Hallmark pathway set for
+the validation, keeping it methodologically distinct from the primary analysis.
+
+```{r}
+run_plage_paired <- function(data, stimulation, pathway_name, gene_set,
+                              visit_pair = c("W0", "W16")) {
+
+  available_genes <- intersect(gene_set, names(data))
+  if (length(available_genes) < 3) return(NULL)
+
+  stim_data <- data %>%
+    filter(Stimulation == stimulation, Visit %in% visit_pair)
+
+  paired_donors <- stim_data %>%
+    group_by(Donor) %>%
+    summarise(
+      has_v1 = any(Visit == visit_pair[1]),
+      has_v2 = any(Visit == visit_pair[2]),
+      .groups = "drop"
+    ) %>%
+    filter(has_v1 & has_v2) %>%
+    pull(Donor)
+
+  if (length(paired_donors) < 3) return(NULL)
+
+  expr_data <- stim_data %>%
+    filter(Donor %in% paired_donors) %>%
+    arrange(Donor, Visit)
+
+  expr_mat      <- t(as.matrix(expr_data[, available_genes]))
+  expr_mat      <- expr_mat - rowMeans(expr_mat)
+  svd_res       <- svd(expr_mat)
+  sample_scores <- svd_res$v[, 1]
+
+  if (cor(sample_scores, colMeans(expr_mat)) < 0) {
+    sample_scores <- -sample_scores
+  }
+
+  expr_data$score <- sample_scores
+
+  w0  <- expr_data %>% filter(Visit == visit_pair[1]) %>% arrange(Donor)
+  w16 <- expr_data %>% filter(Visit == visit_pair[2]) %>% arrange(Donor)
+
+  common_donors <- intersect(w0$Donor, w16$Donor)
+  s0  <- w0$score[match(common_donors, w0$Donor)]
+  s16 <- w16$score[match(common_donors, w16$Donor)]
+
+  test <- tryCatch(
+    t.test(s16, s0, paired = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(test)) return(NULL)
+
+  data.frame(
+    Pathway     = pathway_name,
+    Stimulation = stimulation,
+    N_genes     = length(available_genes),
+    N_pairs     = length(common_donors),
+    Score_diff  = mean(s16 - s0),
+    t_statistic = as.numeric(test$statistic),
+    P_value     = test$p.value,
+    stringsAsFactors = FALSE
+  )
+}
+```
+
+# Run PLAGE for all stimulations (validation)
+
+```{r}
+plage_results <- list()
+
+for (stim in stimulations) {
+  results <- bind_rows(lapply(names(combined_pathways), function(pw) {
+    run_plage_paired(
+      data          = nano_data_resid,
+      stimulation   = stim,
+      pathway_name  = pw,
+      gene_set      = combined_pathways[[pw]]
+    )
+  }))
+
+  if (!is.null(results) && nrow(results) > 0) {
+    results <- results %>%
+      mutate(P_adj = p.adjust(P_value, method = "fdr")) %>%
+      arrange(P_adj)
+
+    plage_results[[stim]] <- results
+
+    cat(sprintf(
+      "%s: %d pathways tested | FDR < 0.01: %d\n | FDR < 0.01: %d\n",
+      stim,
+      nrow(results),
+      sum(results$P_adj < 0.01, na.rm = TRUE),
+      sum(results$P_adj < 0.01, na.rm = TRUE)
+    ))
+  }
+}
+
+all_plage <- bind_rows(plage_results)
+
+sig_plage <- all_plage %>%
+  filter(!is.na(P_adj), P_adj < 0.01) %>%
+  arrange(P_adj)
+
+cat(sprintf("\nPLAGE significant pathways (FDR < 0.01): %d\n", nrow(sig_plage)))
+print(sig_plage)
+
+write_xlsx(all_plage, file.path(output_plage, "PLAGE_all_results.xlsx"))
+write_xlsx(sig_plage, file.path(output_plage, "PLAGE_significant_FDR01.xlsx"))
+```
+
+# PLAGE validation bubble plot
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+
+if (nrow(sig_plage) > 0) {
+
+  pathway_order_plage <- sig_plage %>%
+    arrange(P_adj) %>%
+    pull(Pathway) %>%
+    unique()
+
+  plage_plot_data <- sig_plage %>%
+    mutate(
+      Pathway     = factor(Pathway, levels = pathway_order_plage),
+      Stimulation = factor(Stimulation,
+                           levels = c("Null", "Mtb_Ag", "LPS", "IL1B"))
+    )
+
+  p_plage <- ggplot(
+      plage_plot_data,
+      aes(x = Pathway, y = Stimulation,
+          size = -log10(P_adj), color = Score_diff)
+    ) +
+    geom_point(alpha = 0.8) +
+    scale_color_gradient2(
+      low      = "blue",
+      mid      = "white",
+      high     = "red",
+      midpoint = 0,
+      name     = "Score difference\n(W16 minus W0)"
+    ) +
+    scale_size_continuous(range = c(3, 10), name = "-log10(FDR)") +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_discrete(drop = FALSE) +
+    labs(
+      title    = "Pathway activity changes: W16 vs W0 (PLAGE validation)",
+      subtitle = "NanoString panel annotations | Paired t-test, FDR < 0.01 | Red: higher at W16 | Blue: higher at W0",
+      x        = "Pathway",
+      y        = "Stimulation"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x      = element_text(angle = 45, hjust = 1, color = "black", size = 9),
+      axis.text.y      = element_text(color = "black"),
+      panel.grid.major = element_line(color = "gray90"),
+      legend.position  = "right"
+    )
+
+  print(p_plage)
+
+  ggsave(
+    file.path(output_fig3c, "3C_PLAGE_validation_bubble_plot.pdf"),
+    plot   = p_plage,
+    width  = 30,
+    height = 6,
+    units  = "in"
+  )
+}
+```
+
+# Cross-validation: pathways significant in both analyses
+
+Pathways that are significant in both the NanoTube primary analysis and the
+PLAGE validation are the most robust findings. Only NanoString-defined pathways
+are compared here since PLAGE uses NanoString annotations only.
+
+```{r}
+nanotube_nanostring_sig <- nanotube_sig %>%
+  select(pathway, Stimulation, NES, padj) %>%
+  rename(NanoTube_NES = NES, NanoTube_padj = padj)
+
+plage_sig_long <- sig_plage %>%
+  select(Pathway, Stimulation, Score_diff, P_adj) %>%
+  rename(
+    pathway        = Pathway,
+    PLAGE_Score_diff = Score_diff,
+    PLAGE_padj       = P_adj
+  )
+
+confirmed <- inner_join(
+  nanotube_nanostring_sig,
+  plage_sig_long,
+  by = c("pathway", "Stimulation")
+) %>%
+  arrange(NanoTube_padj)
+
+cat(sprintf(
+  "Pathways significant in both NanoTube and PLAGE: %d\n",
+  nrow(confirmed)
+))
+
+print(confirmed)
+
+write_xlsx(confirmed, file.path(output_fig3c, "Confirmed_pathways_both_methods.xlsx"))
+```
+# Figure 3C: Cross-validation bubble plot
+# Shows only pathways significant in both NanoTube and PLAGE.
+# Bubble size reflects NanoTube FDR. Colour reflects NanoTube NES direction.
+# A separate score difference column from PLAGE is shown as a secondary label.
+```{r}
+if (nrow(confirmed) > 0) {
+
+  confirmed_plot <- confirmed %>%
+    mutate(
+      pathway_short = ifelse(
+        grepl("^HALLMARK_", pathway),
+        paste0("Hallmark: ", gsub("_", " ", gsub("^HALLMARK_", "", pathway))),
+        gsub("_", " ", pathway)
+      ),
+      Stimulation = factor(Stimulation,
+                           levels = c("Null", "Mtb_Ag", "LPS", "IL1B"))
+    )
+
+  pathway_order_confirmed <- confirmed_plot %>%
+    arrange(NanoTube_padj) %>%
+    pull(pathway_short) %>%
+    unique()
+
+  confirmed_plot <- confirmed_plot %>%
+    mutate(pathway_short = factor(pathway_short, levels = pathway_order_confirmed))
+
+  p_confirmed <- ggplot(
+      confirmed_plot,
+      aes(x = pathway_short, y = Stimulation,
+          size = -log10(NanoTube_padj), color = NanoTube_NES)
+    ) +
+    geom_point(alpha = 0.8) +
+    scale_color_gradient2(
+      low      = "blue",
+      mid      = "white",
+      high     = "red",
+      midpoint = 0,
+      name     = "NES\n(NanoTube)"
+    ) +
+    scale_size_continuous(range = c(3, 10), name = "-log10(FDR)\n(NanoTube)") +
+    scale_x_discrete(drop = FALSE) +
+    scale_y_discrete(drop = FALSE) +
+    labs(
+      title    = "Significant pathways in NanoTube and PLAGE | NanoString immune panel and Hallmark",
+      subtitle = "Cross-validated results | FDR < 0.01 in both analyses | Red: higher at W16; Blue: higher at W0",
+      x        = "Pathway",
+      y        = "Stimulation"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.x      = element_text(angle = 45, hjust = 1, color = "black", size = 9),
+      axis.text.y      = element_text(color = "black"),
+      panel.grid.major = element_line(color = "gray90"),
+      legend.position  = "right"
+    )
+
+  print(p_confirmed)
+
+  ggsave(
+    file.path(output_fig3c, "3C_Confirmed_pathways_bubble_plot.pdf"),
+    plot   = p_confirmed,
+    width  = 10,
+    height = 6,
+    units  = "in"
+  )
+
+} else {
+  cat("No pathways confirmed in both analyses. No plot generated.\n")
+}
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```

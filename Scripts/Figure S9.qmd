@@ -1,0 +1,245 @@
+---
+title: "Figure S9"
+subtitle: "Individual variability in biomarker responses during successful treatment"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+This document generates line plots to show individual variability in Mtb_Ag-induced cytokine
+responses during successful treatment (Figure S9). Each line represents one
+patient tracked across visits. Lines are coloured red for patients infected with
+Mtb lineage 2 whose concentration exceeds their Visit 0 value at any subsequent
+visit, blue for lineage 4 patients with the same pattern, and black for patients
+whose concentration does not exceed their Visit 0 value.
+
+# Load packages
+
+```{r}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(DataExplorer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+# Define file paths
+
+```{r}
+input_file    <- "Input/Cytokines_cleaned_log10_Predict-TB.xlsx"
+lineage_file  <- "Input/Demographic and clinical information.xlsx"
+output_s9     <- "Output/Figure_S9"
+
+dir.create(output_s9, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Load lineage data
+
+The lineage file is loaded and reduced to the two columns needed for joining.
+Check that the patient ID column name matches ID1 used in the protein data.
+
+```{r}
+lineage_data <- read_excel(lineage_file, sheet = 1) %>%
+  select(ID1, main_lineage) %>%
+  distinct()
+
+head(lineage_data)
+cat(sprintf(
+  "Patients with lineage data: %d | Lineages present: %s\n",
+  nrow(lineage_data),
+  paste(unique(lineage_data$main_lineage), collapse = ", ")
+))
+```
+
+# Filter to successful treatment outcome and Mtb_Ag stimulation
+
+```{r}
+protein_data <- all_data %>%
+  filter(Comments == "success") %>%
+  filter(Condition == "Mtb_Ag")
+```
+
+# Define cytokine columns
+
+```{r}
+cytokine_cols <- c(
+  "BDNF", "CCL11", "Factor_VII", "ICAM_1",
+  "IL_1_alpha", "IL_1_beta", "IL_10", "IL_12p40",
+  "IL_12p70", "IL_18", "IL_1RA", "IL_3", "IL_4",
+  "IL_6", "IL_7", "IL_8", "CCL2", "CCL3",
+  "MMP_3", "TNF", "VEGF", "IFNG", "IL_2",
+  "pan_IFNA", "IFNB"
+)
+```
+
+# Line plot function
+
+For each cytokine, patients are flagged as increased if their concentration
+exceeds their Visit 0 value at any subsequent visit. Increased patients are
+then coloured by Mtb lineage: red for lineage 2 and blue for lineage 4.
+Patients without an increase are shown in black. Patients with no Visit 0
+measurement or no lineage information are shown in black.
+
+```{r}
+plot_cytokine_lines <- function(data,
+                                cytokine_name,
+                                lineage_data = NULL,
+                                save_path    = NULL,
+                                plot_width   = 4,
+                                plot_height  = 6.5) {
+
+  plot_data <- data %>%
+    select(ID1, Visit, Condition, Concentration = all_of(cytokine_name)) %>%
+    filter(!is.na(Concentration)) %>%
+    mutate(Visit = as.numeric(Visit))
+
+  if (nrow(plot_data) == 0) {
+    warning(paste("No data for", cytokine_name))
+    return(invisible(NULL))
+  }
+
+  # Visit 0 baseline per patient and condition
+  baseline <- plot_data %>%
+    filter(Visit == 0) %>%
+    select(ID1, Condition, Baseline = Concentration)
+
+  # Flag patients where concentration exceeds baseline at any post-baseline visit
+  plot_data <- plot_data %>%
+    left_join(baseline, by = c("ID1", "Condition")) %>%
+    group_by(ID1, Condition) %>%
+    mutate(
+      increased = any(Concentration[Visit != 0] > Baseline, na.rm = TRUE)
+    ) %>%
+    ungroup()
+
+  # Join lineage information if provided
+  if (!is.null(lineage_data)) {
+    plot_data <- plot_data %>%
+      left_join(lineage_data, by = "ID1")
+  } else {
+    plot_data <- plot_data %>%
+      mutate(main_lineage = NA_character_)
+  }
+
+  # Assign line colour based on increased status and lineage
+  plot_data <- plot_data %>%
+    mutate(
+      line_color = case_when(
+        !increased                        ~ "Not increased",
+        increased & main_lineage == "lineage2" ~ "Lineage 2",
+        increased & main_lineage == "lineage4" ~ "Lineage 4",
+        TRUE                              ~ "Not increased"
+      )
+    )
+
+  visit_range <- range(plot_data$Visit, na.rm = TRUE)
+
+  p <- ggplot(
+      plot_data,
+      aes(x = Visit, y = Concentration, group = ID1, color = line_color)
+    ) +
+    geom_line(linewidth = 0.5) +
+    geom_point(size = 1) +
+    facet_grid(~ Condition) +
+    scale_x_continuous(
+      breaks = seq(visit_range[1], visit_range[2], by = 8)
+    ) +
+    scale_color_manual(
+      values = c(
+        "Lineage 2"    = "red",
+        "Lineage 4"    = "#00CCFF",
+        "Not increased" = "black"
+      ),
+      name = NULL
+    ) +
+    labs(
+      title = cytokine_name,
+      x     = "Visit (Week)",
+      y     = "Concentration (log10 pg/mL)"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      panel.border     = element_rect(color = "black", fill = NA),
+      strip.background = element_rect(fill = "grey95", color = "black"),
+      legend.position  = "bottom"
+    )
+
+  print(p)
+
+  if (!is.null(save_path)) {
+    ggsave(
+      filename = file.path(save_path, paste0(cytokine_name, "_lines.png")),
+      plot     = p,
+      width    = plot_width,
+      height   = plot_height,
+      units    = "in"
+    )
+  }
+
+  invisible(p)
+}
+```
+
+# Figure S9: Line plots across all conditions
+
+```{r}
+for (cyt in cytokine_cols) {
+  plot_cytokine_lines(
+    data          = protein_data,
+    cytokine_name = cyt,
+    lineage_data  = lineage_data,
+    save_path     = output_s9
+  )
+}
+```
+
+# Patient lookup table
+
+A subset of cytokines measured under Mtb_Ag stimulation is extracted to help
+identify patients with distinct response patterns.
+
+```{r}
+lookup_cytokines <- c("IFNG", "IL_1RA", "IL_1_beta", "IL_2")
+
+patient_lookup <- protein_data %>%
+  select(ID1, Visit, Condition, all_of(lookup_cytokines)) %>%
+  filter(Condition == "Mtb_Ag") %>%
+  mutate(across(all_of(lookup_cytokines), ~ .x)) %>%
+  left_join(lineage_data, by = "ID1")
+
+head(patient_lookup)
+```
+
+# Session information
+
+```{r}
+sessionInfo()
+```

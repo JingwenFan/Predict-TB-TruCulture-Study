@@ -1,0 +1,454 @@
+---
+title: "Figure S13C"
+subtitle: "Impacts of demographic and clinical factors on protein biomarkers at pre-treatment time point (W0)"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Impacts of demographic and clinical factors on protein biomarkers at 
+pre-treatment time point (W0). The low multicollinearity among all tested demographic 
+and clinical factors (VIF < 2.5, Figure S13A) suggests that these factors are largely 
+independent. Given the small sample size (n = 33 for the treatment success group), 
+associations are explored using univariate linear models.
+
+Figure S13C: It was reported in the literature that Mtb-infected female mice have higher IFNG and lower IL-10 compared to male mice. We tested if sex also affects IFNG and IL-10 levels in our human TB cohort.
+
+# Load packages
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(readxl)
+library(DataExplorer)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(writexl)
+library(broom)
+library(ggpubr)
+```
+
+# Define file paths
+
+```{r}
+#| label: file-paths
+
+input_file  <- "Input/Cytokines_cleaned_log10_Predict-TB.xlsx"
+input_pet   <- "Input/PET.CT_long_SATVI.xlsx"
+input_mtb   <- "Input/Mtb.lineage_SATVI_ID_Predict-TB_TS.xlsx"
+output_main <- "Output/Figure_S13C"
+
+dir.create(output_main, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+#| label: load-data
+
+cytokine_data <- read_excel(input_file, sheet = 1) %>%
+  filter(Comments == "success") %>%
+  mutate(
+    Condition   = ifelse(Condition == "TB", "Mtb_Ag", Condition),
+    Visit       = paste0("W", Visit),
+    Age         = as.numeric(Age),
+    BMI         = as.numeric(BMI),
+    Temp_0      = as.numeric(Temp_0),
+    MGIT        = as.numeric(MGIT),
+    Sex         = factor(Sex, levels = c("Female", "Male")),
+    Smoking     = ifelse(Smoking == "active smoker", "active_smoker_Yes", "active_smoker_No"),
+    Previous_TB = ifelse(Previous_TB == "0 episode", "No", "Yes")
+  )
+
+str(cytokine_data)
+
+pet_data <- read_excel(input_pet, sheet = 1) %>%
+  filter(Comments == "success") %>%
+  select(ID1, Visit, CAVTOT, TLG) %>%
+  mutate(
+    Visit  = paste0("W", Visit),
+    CAVTOT = log10(1 + CAVTOT),   
+    TLG    = log10(1 + TLG)
+  )
+
+head(pet_data)
+dim(pet_data)
+
+mtb_data <- read_excel(input_mtb, sheet = 1) %>%
+  filter(Comments == "success") %>%
+  select(ID1, main_lineage)
+
+head(mtb_data)
+dim(mtb_data)
+```
+
+# Merge cytokine, PET, and Mtb data sets
+
+```{r}
+#| label: merge-data
+
+all_data <- cytokine_data %>%
+  left_join(pet_data, by = c("ID1", "Visit")) %>%
+  left_join(mtb_data, by = "ID1") %>%
+  filter(Visit == "W0")
+
+dim(all_data)
+head(all_data)
+```
+
+# Define cytokine columns
+
+```{r}
+#| label: define-cytokines
+cytokine_cols <- c(
+ "BDNF", "CCL11", "Factor_VII", "ICAM_1",
+  "IL_1_alpha", "IL_1_beta", "IL_10", "IL_12p40",
+  "IL_12p70", "IL_18", "IL_1RA", "IL_3", "IL_4",
+  "IL_6", "IL_7", "IL_8", "CCL2", "CCL3",
+  "MMP_3", "TNF", "VEGF", "IFNG", "IL_2",
+  "pan_IFNA", "IFNB"
+)
+
+cat(sprintf("Cytokines retained: %d\n", length(cytokine_cols)))
+```
+
+# Variance filtering by condition
+
+```{r}
+#| label: variance-filtering
+#| message: true
+
+conditions <- c("Null", "Mtb_Ag", "LPS", "IL1B")
+
+variance_threshold <- 0.1
+
+filtered_cytokines <- list()
+
+for (condition in conditions) {
+  
+  condition_data <- all_data %>% filter(Condition == condition)
+  
+  cytokine_sds <- sapply(cytokine_cols, function(cyt) {
+    sd(condition_data[[cyt]], na.rm = TRUE)
+  })
+  
+  filtered_cytokines[[condition]] <- cytokine_cols[cytokine_sds > variance_threshold]
+  
+  excluded <- cytokine_cols[cytokine_sds <= variance_threshold]
+  if (length(excluded) > 0) {
+    message(sprintf(
+      "Condition [%s] — excluding low-variance cytokines: %s",
+      condition, paste(excluded, collapse = ", ")
+    ))
+  }
+}
+```
+
+# Univariate linear model fitting
+
+```{r}
+#| label: model-fitting
+#| message: true
+#| warning: false
+
+categorical_vars <- c("Sex", "Smoking", "main_lineage", "Previous_TB")
+numeric_vars     <- c("Age", "BMI", "Temp_0", "MGIT", "CAVTOT", "TLG")
+
+model_results <- list()
+
+for (condition in conditions) {
+  
+  condition_data <- all_data %>% filter(Condition == condition)
+  
+  # Validate categorical predictors (require ≥ 2 observed levels)
+  valid_categorical_vars <- categorical_vars[sapply(categorical_vars, function(var) {
+    n_lev <- n_distinct(condition_data[[var]], na.rm = TRUE)
+    if (n_lev < 2) {
+      message(sprintf(
+        "Condition [%s] — excluding categorical var '%s': only %d level(s) observed.",
+        condition, var, n_lev
+      ))
+    }
+    n_lev >= 2
+  })]
+  
+  # Validate numeric predictors (require ≥ 2 unique non-NA values) 
+  valid_numeric_vars <- numeric_vars[sapply(numeric_vars, function(var) {
+    n_uniq <- n_distinct(condition_data[[var]], na.rm = TRUE)
+    if (n_uniq < 2) {
+      message(sprintf(
+        "Condition [%s] — excluding numeric var '%s': insufficient variability.",
+        condition, var
+      ))
+    }
+    n_uniq >= 2
+  })]
+  
+  valid_predictors <- c(valid_numeric_vars, valid_categorical_vars)
+  
+  if (length(valid_predictors) == 0) {
+    message(sprintf("Condition [%s] — no valid predictors; skipping.", condition))
+    next
+  }
+  
+  # Standardise numeric predictors
+  condition_data <- condition_data %>%
+    mutate(across(all_of(valid_numeric_vars), ~ as.numeric(scale(.x))))
+  
+  # Get cytokines passing variance filter for this condition
+  valid_cytokines <- filtered_cytokines[[condition]]
+  
+  if (length(valid_cytokines) == 0) {
+    message(sprintf("Condition [%s] — no cytokines pass variance filter; skipping.", condition))
+    next
+  }
+  
+  # Standardise cytokines
+  condition_data <- condition_data %>%
+    mutate(across(all_of(valid_cytokines), ~ as.numeric(scale(.x))))
+  
+  # Fit one univariate model per cytokine × predictor pair
+  for (cytokine in valid_cytokines) {
+    for (predictor in valid_predictors) {
+      
+      formula <- as.formula(paste(cytokine, "~", predictor))
+      
+      tryCatch({
+        model      <- lm(formula, data = condition_data)
+        tidy_model <- broom::tidy(model, conf.int = TRUE)
+        
+        tidy_model$Cytokine  <- cytokine
+        tidy_model$Condition <- condition
+        
+        model_results[[paste(condition, cytokine, predictor, sep = "_")]] <- tidy_model
+        
+      }, error = function(e) {
+        message(sprintf(
+          "Model error — condition: %s | cytokine: %s | predictor: %s\n  %s",
+          condition, cytokine, predictor, e$message
+        ))
+      })
+    }
+  }
+}
+
+# Combine all results and apply FDR correction within each condition
+results_df <- bind_rows(model_results) %>%
+  filter(term != "(Intercept)") %>%
+  group_by(Condition) %>%                         
+  mutate(p.adjusted = p.adjust(p.value, method = "fdr")) %>%
+  ungroup()
+
+cat(sprintf("Total model terms (excluding intercepts): %d\n", nrow(results_df)))
+```
+
+# Filter significant results and tidy labels
+
+```{r}
+#| label: filter-significant
+
+significant_df <- results_df %>%
+  filter(p.value < 0.05) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      TRUE               ~ ""
+    ),
+    term = case_when(
+      term == "SexMale"               ~ "Sex_Male",
+      term == "Previous_TBYes"        ~ "Previous_TB_Yes",
+      term == "main_lineagelineage4"  ~ "lineage4",
+      term == "Smokingactive_smoker_Yes" ~ "active_smoker_Yes",
+      term == "Temp_0"                ~ "Temperature",
+      term == "CAVTOT"                ~ "total cavity volume",
+      term == "TLG"                   ~ "total lesion glycolysis volume",
+      TRUE                            ~ term
+    )
+  ) %>%
+  arrange(Condition, Cytokine, term)
+
+# Ordered factor levels
+significant_df$Condition <- factor(
+  significant_df$Condition,
+  levels = c("Null", "Mtb_Ag", "LPS", "IL1B")
+)
+
+predictor_order <- c(
+  "Age", "Sex_Male", "BMI", "Temperature",
+  "active_smoker_Yes", "MGIT", "lineage4", "Previous_TB_Yes",
+  "total cavity volume", "total lesion glycolysis volume"
+)
+
+significant_df$term <- factor(significant_df$term, levels = predictor_order)
+
+cat(sprintf("Significant associations (p < 0.05): %d\n", nrow(significant_df)))
+```
+
+# Heatmap plot
+
+```{r}
+#| label: heatmap-plot
+#| fig-width: 14
+#| fig-height: 10
+
+heatmap_plot <- ggplot(significant_df, aes(x = term, y = Cytokine, fill = estimate)) +
+  geom_tile(color = "#999999") +
+  geom_text(aes(label = significance), color = "black", size = 4) +
+  scale_fill_gradient2(
+    low      = "blue",
+    mid      = "white",
+    high     = "red",
+    midpoint = 0,
+    na.value = "white",
+    name     = "Standardized\nEffect Size"
+  ) +
+  facet_wrap(~ Condition, nrow = 1) +
+  labs(
+    title    = "Correlations of demographic and clinical predictors with W0 cytokine levels (log10)",
+    subtitle = "P value without FDR corrections: * < 0.05  ** < 0.01  *** < 0.001",
+    x        = "Predictor",
+    y        = "Protein biomarker (log10 pg/mL)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    legend.position  = "bottom",
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    panel.spacing.x  = unit(0.05, "lines"),
+    panel.border     = element_rect(color = "black", fill = NA, linewidth = 0.5),
+    strip.background = element_rect(fill = "lightgrey", color = "black")
+  )
+
+print(heatmap_plot)
+```
+
+# Save outputs
+
+```{r}
+#| label: save-outputs
+
+ggsave(
+  filename = file.path(output_main, "Figure_5E_heatmap.pdf"),
+  plot     = heatmap_plot,
+  width    = 14,
+  height   = 10
+)
+
+write_xlsx(
+  list(
+    "All_results"          = results_df,
+    "Significant_FDR_0.05" = significant_df
+  ),
+  path = file.path(output_main, "Figure_5E_model_results.xlsx")
+)
+
+cat("Outputs saved to:", output_main, "\n")
+```
+Check how sex affects Null_IFNG at W0
+```{r}
+#| label: plot-ifng-sex
+#| fig-width: 6
+#| fig-height: 6
+
+# Extract the data
+ifng_null <- all_data %>%
+  filter(Condition == "Null") %>%
+  select(ID1, Sex, IFNG) %>%
+  drop_na(Sex, IFNG)
+
+ifng_plot <- ggplot(ifng_null, aes(x = Sex, y = IFNG, fill = Sex)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.8) +
+  stat_compare_means(
+    method  = "wilcox.test",
+    label   = "p.format",
+    comparisons = list(c("Female", "Male"))
+  ) +
+  scale_fill_manual(values = c("Female" = "#E76BF3", "Male" = "#00B0F6")) +
+  labs(
+    title    = "Null_IFNG at W0",
+    subtitle = "Wilcoxon test",
+    x        = NULL,
+    y        = "Null_IFNG (log10 pg/mL)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(ifng_plot)
+
+# Save the plot
+ggsave(
+  filename = file.path(output_main, "Null_IFNG_Sex.pdf"),
+  plot     = ifng_plot,
+  width    = 4.5,
+  height   = 4.5
+)
+```
+
+Check how sex affects LPS_IL-10 at W0
+```{r}
+#| label: plot-il10-sex
+#| fig-width: 6
+#| fig-height: 6
+
+# Extract the data
+IL_10_lps <- all_data %>%
+  filter(Condition == "LPS") %>%
+  select(ID1, Sex, IL_10) %>%
+  drop_na(Sex, IL_10)
+
+il10_plot <- ggplot(IL_10_lps, aes(x = Sex, y = IL_10, fill = Sex)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.1, size = 2, alpha = 0.8) +
+  stat_compare_means(
+    method  = "wilcox.test",
+    label   = "p.format",
+    comparisons = list(c("Female", "Male"))
+  ) +
+  scale_fill_manual(values = c("Female" = "#E76BF3", "Male" = "#00B0F6")) +
+  labs(
+    title    = "LPS_IL_10 at W0",
+    subtitle = "Wilcoxon test",
+    x        = NULL,
+    y        = "LPS_IL_10 (log10 pg/mL)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(il10_plot)
+
+# Save the plot
+ggsave(
+  filename = file.path(output_main, "LPS_IL10_Sex.pdf"),
+  plot     = il10_plot,
+  width    = 4.5,
+  height   = 4.5
+)
+```
+# Session information
+
+```{r}
+sessionInfo()
+```
