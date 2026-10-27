@@ -1,0 +1,341 @@
+---
+title: "Figures S13B, S13D, and S13E"
+subtitle: "LOESS smoothing of Sex/Previous_TB/main_lineage and treatment impact on PET/CT lung lesions"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Figure S13B: LOESS smoothing of Sex and treatment impact on PET/CT lung lesions.
+Figure S13D: LOESS smoothing of Previous TB history and treatment impact on PET/CT lung lesions.
+Figure S13E: LOESS smoothing of Mtb lineage and treatment impact on PET/CT lung lesions.
+
+Each LOESS plot is annotated with p-values from a linear mixed-effects model of the form
+outcome ~ Visit * group + (1|ID1), where Visit is treated as numeric (weeks: 0, 4, 16, 24).
+The LME provides a formal statistical test of the linear group × time interaction alongside
+the non-parametric visual trend from LOESS.
+
+# Load packages
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(car)
+library(writexl)
+```
+
+# Define file paths
+
+```{r}
+#| label: file-paths
+
+input_file  <- "Input/Demographic and clinical information.xlsx"
+input_pet   <- "Input/PET.CT_long_SATVI.xlsx"
+output_main <- "Output/Figure_S13B_S13D_S13E"
+
+dir.create(output_main, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+#| label: load-data
+
+demo_data <- read_excel(input_file, sheet = 1) %>%
+  filter(Comments == "success")
+
+str(demo_data)
+
+pet_data <- read_excel(input_pet, sheet = 1) %>%
+  filter(Comments == "success") %>%
+  select(ID1, Visit, CAVTOT, TLG) %>%
+  mutate(
+    CAVTOT = log10(1 + CAVTOT),
+    TLG    = log10(1 + TLG)
+  )
+
+head(pet_data)
+dim(pet_data)
+```
+
+# Merge data sets
+
+```{r}
+#| label: merge-data
+
+all_data <- demo_data %>%
+  left_join(pet_data, by = "ID1") %>%
+  select(ID1, Visit, Sex, Previous_TB, main_lineage, CAVTOT, TLG)
+
+dim(all_data)
+head(all_data)
+```
+
+# Curate data
+
+```{r}
+#| label: curate-data
+
+test_data <- all_data %>%
+  mutate(
+    Visit        = as.numeric(Visit),
+    CAVTOT       = as.numeric(CAVTOT),
+    TLG          = as.numeric(TLG),
+    Sex          = factor(Sex, levels = c("Female", "Male")),
+    main_lineage = factor(main_lineage, levels = c("lineage2", "lineage4")),
+    Previous_TB  = factor(
+                     ifelse(Previous_TB == "0 episode", "No", "Yes"),
+                     levels = c("No", "Yes")
+                   )
+  )
+
+str(test_data)
+
+cat("Visits present:", sort(unique(test_data$Visit)), "\n")
+```
+
+# Define colour schemes
+
+```{r}
+#| label: colour-schemes
+
+sex_colors         <- c("Female" = "#E76BF3", "Male"    = "#00B0F6")
+previous_tb_colors <- c("No"     = "#00BA38", "Yes"     = "#FF6600")
+lineage_colors     <- c("lineage2" = "orange", "lineage4" = "royalblue")
+```
+
+# P-value formatting helper
+
+```{r}
+#| label: format-p
+
+format_p <- function(p) {
+  if (is.na(p)) return("p = NA")
+  stars <- if (p < 0.001) "***" else if (p < 0.01) "**" else if (p < 0.05) "*" else "ns"
+  label <- if (p < 0.001) "p < 0.001" else sprintf("p = %.3f", p)
+  paste0(label, " ", stars)
+}
+```
+
+# LOESS and LME plot function
+
+```{r}
+#| label: plot-function
+#| message: false
+#| warning: false
+
+plot_loess_lme <- function(data, outcome, outcome_label,
+                            group_var, group_label, group_colors,
+                            save_path = NULL) {
+
+  outcome_sym <- sym(outcome)
+  group_sym   <- sym(group_var)
+
+  # Prepare data
+  dat <- data %>%
+    select(ID1, Visit, all_of(c(outcome, group_var))) %>%
+    drop_na() %>%
+    mutate(
+      Visit = as.numeric(Visit),
+      ID1   = as.factor(ID1)
+    )
+
+  cat(sprintf(
+    "\n%s ~ %s | N rows: %d | N participants: %d\n",
+    outcome, group_var, nrow(dat), n_distinct(dat$ID1)
+  ))
+
+  # Fit LME: outcome ~ Visit * group_var + (1|ID1)
+  # Visit is numeric — tests linear group x time interaction
+  formula_str <- paste(outcome, "~ Visit *", group_var, "+ (1|ID1)")
+
+  lme_annotation <- tryCatch({
+
+    model     <- lmer(as.formula(formula_str), data = dat, REML = FALSE)
+    anova_res <- Anova(model, type = 3)
+
+    visit_p       <- anova_res["Visit",                     "Pr(>Chisq)"]
+    group_p       <- anova_res[group_var,                   "Pr(>Chisq)"]
+    interaction_p <- anova_res[paste0("Visit:", group_var), "Pr(>Chisq)"]
+
+    paste0(
+      "LME p-values\n",
+      "Visit:        ", format_p(visit_p),       "\n",
+      group_label, ": ", format_p(group_p),      "\n",
+      "Interaction:  ", format_p(interaction_p)
+    )
+
+  }, error = function(e) {
+    message("LME failed for ", group_var, " ~ ", outcome, ": ", e$message)
+    "LME: model failed"
+  })
+
+  # Build plot
+  p <- ggplot(dat, aes(
+      x     = Visit,
+      y     = !!outcome_sym,
+      color = !!group_sym,
+      fill  = !!group_sym,
+      group = !!group_sym
+    )) +
+    geom_smooth(
+      method    = "loess",
+      se        = TRUE,
+      span      = 0.75,
+      linewidth = 1.2,
+      alpha     = 0.2
+    ) +
+    geom_jitter(width = 0.2, height = 0, alpha = 0.7, size = 2) +
+    annotate(
+      "text",
+      x     = Inf, y = Inf,
+      label = lme_annotation,
+      hjust = 1.05, vjust = 1.1,
+      size  = 3.5, color = "black"
+    ) +
+    scale_color_manual(values = group_colors, name = group_label) +
+    scale_fill_manual(values  = group_colors, name = group_label) +
+    scale_x_continuous(
+      breaks = c(0, 4, 16, 24),
+    ) +
+    labs(
+      title    = paste(group_label, "and treatment effect on", outcome_label),
+      subtitle = "LOESS smoothing with 95% CI | LME statistical test",
+      x        = "Visit (week)",
+      y        = outcome_label
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      legend.position  = "top",
+      plot.title       = element_text(face = "bold"),
+      axis.title       = element_text(face = "bold", color = "black"),
+      axis.text        = element_text(color = "black"),                   
+      panel.grid.minor = element_blank(),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.border     = element_rect(color = "black", fill = NA)
+    )
+
+  print(p)
+
+  if (!is.null(save_path)) {
+    ggsave(
+      filename = file.path(save_path,
+                           paste0(group_var, "_", outcome, "_LOESS_LME.pdf")),
+      plot     = p,
+      width    = 5,
+      height   = 5.5
+    )
+  }
+
+  invisible(p)
+}
+```
+
+# Define outcomes
+
+```{r}
+#| label: define-outcomes
+
+outcomes <- list(
+  CAVTOT = "Total cavity volume (log10 mL)",
+  TLG    = "Total lesion glycolysis (log10 mL)"
+)
+```
+
+# Sex
+
+```{r}
+#| label: fig-s13b
+#| fig-width: 7
+#| fig-height: 6
+#| message: false
+#| warning: false
+
+for (out_name in names(outcomes)) {
+  plot_loess_lme(
+    data          = test_data,
+    outcome       = out_name,
+    outcome_label = outcomes[[out_name]],
+    group_var     = "Sex",
+    group_label   = "Sex",
+    group_colors  = sex_colors,
+    save_path     = output_main
+  )
+}
+```
+
+# Previous TB
+
+```{r}
+#| label: fig-s13d
+#| fig-width: 7
+#| fig-height: 6
+#| message: false
+#| warning: false
+
+for (out_name in names(outcomes)) {
+  plot_loess_lme(
+    data          = test_data,
+    outcome       = out_name,
+    outcome_label = outcomes[[out_name]],
+    group_var     = "Previous_TB",
+    group_label   = "Previous TB",
+    group_colors  = previous_tb_colors,
+    save_path     = output_main
+  )
+}
+```
+
+# Mtb lineage
+
+```{r}
+#| label: fig-s13e
+#| fig-width: 7
+#| fig-height: 6
+#| message: false
+#| warning: false
+
+for (out_name in names(outcomes)) {
+  plot_loess_lme(
+    data          = test_data,
+    outcome       = out_name,
+    outcome_label = outcomes[[out_name]],
+    group_var     = "main_lineage",
+    group_label   = "Mtb lineage",
+    group_colors  = lineage_colors,
+    save_path     = output_main
+  )
+}
+```
+
+# Session information
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

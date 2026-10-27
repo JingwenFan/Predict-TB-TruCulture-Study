@@ -1,0 +1,492 @@
+---
+title: "Figure S5A"
+subtitle: "MoSAR cohort validation for treatment response biomarkers identified from SATVI cohort"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+MoSAR cohort validation for treatment response biomarkers identified from the
+SATVI cohort. Paired Wilcoxon tests compare cytokine concentrations between
+baseline (Visit 0) and end of treatment (Visit 24). Due to small sample size
+(12 paired TB patients before and after treatment), fold change instead of p value
+is reported. AUC-ROC of the identified biomarkers is also reported at the end.
+
+# Load packages
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggpubr)
+library(pROC)
+library(purrr)
+library(writexl)
+```
+
+# Define file paths
+
+```{r}
+#| label: file-paths
+
+input_file <- "Input/MoSAR_treatment_response_20251222_Luminex_TruC.xlsx"
+output_main <- "Output/Figure_S5A"
+
+dir.create(output_main, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load data
+
+```{r}
+#| label: load-data
+
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Define metadata and cytokine columns
+
+```{r}
+#| label: define-columns
+
+id_col   <- "Subject_ID"
+meta_cols <- c(id_col, "Visit")
+
+# cytokine columns defined by range LPS_IL_1RA to Null_CCL2
+lps_idx  <- which(names(all_data) == "LPS_IL_1RA")
+ccl2_idx <- which(names(all_data) == "Null_CCL2")
+
+cytokine_cols <- names(all_data)[lps_idx:ccl2_idx]
+cytokine_cols <- setdiff(cytokine_cols, meta_cols)
+
+cat(sprintf("Metadata columns : %s\n", paste(meta_cols, collapse = ", ")))
+cat(sprintf("Cytokine columns : %d\n", length(cytokine_cols)))
+cat(sprintf("First 5          : %s\n", paste(head(cytokine_cols, 5), collapse = ", ")))
+cat(sprintf("Last 5           : %s\n", paste(tail(cytokine_cols, 5), collapse = ", ")))
+```
+
+# Recode Visit and check data
+
+```{r}
+#| label: recode-visit
+
+all_data <- all_data %>%
+  mutate(
+    Visit   = as.numeric(Visit),
+    Subject_ID = as.character(Subject_ID)
+  )
+
+cat("Visits present:", paste(sort(unique(all_data$Visit)), collapse = ", "), "\n")
+cat("Subjects      :", n_distinct(all_data$Subject_ID), "\n")
+cat("Total rows    :", nrow(all_data), "\n")
+```
+
+# Log10 transform cytokine values
+
+```{r}
+#| label: log-transform
+
+protein_data_log <- all_data %>%
+  mutate(across(all_of(cytokine_cols), ~ log10(.x)))
+
+head(protein_data_log[, c(meta_cols, head(cytokine_cols, 3))])
+```
+
+# Paired analysis function
+
+```{r}
+#| label: analysis-function
+
+analyze_cytokines_paired <- function(data, cytokine_cols,
+                                     visit_0     = 0,
+                                     visit_24    = 24,
+                                     save_path   = NULL,
+                                     plot_width  = 3.5,
+                                     plot_height = 5) {
+
+  results <- list()
+
+  for (cyt in cytokine_cols) {
+
+    tryCatch({
+
+      # Subset to Visit 0 and Visit 24
+      v0_data <- data %>%
+        filter(Visit == visit_0) %>%
+        arrange(Subject_ID) %>%
+        select(Subject_ID, value_v0 = all_of(cyt))
+
+      v24_data <- data %>%
+        filter(Visit == visit_24) %>%
+        arrange(Subject_ID) %>%
+        select(Subject_ID, value_v24 = all_of(cyt))
+
+      # Paired join
+      paired_data <- inner_join(v0_data, v24_data, by = "Subject_ID") %>%
+        drop_na(value_v0, value_v24)
+
+      if (nrow(paired_data) < 3) {
+        message(sprintf("%s: insufficient pairs (n = %d) : skipping.", cyt, nrow(paired_data)))
+        next
+      }
+
+      paired_data <- paired_data %>%
+        mutate(
+          log10_fc    = value_v24 - value_v0,   
+          fold_change = 10^log10_fc               
+        )
+
+      median_log10_fc <- median(paired_data$log10_fc,    na.rm = TRUE)
+      median_fc       <- median(paired_data$fold_change, na.rm = TRUE)
+
+      # Reshape to long format for ggplot
+      plot_data <- paired_data %>%
+        select(Subject_ID, value_v0, value_v24) %>%
+        pivot_longer(
+          cols      = c(value_v0, value_v24),
+          names_to  = "Visit_label",
+          values_to = "log10_conc"
+        ) %>%
+        mutate(
+          Visit_label = factor(
+            ifelse(Visit_label == "value_v0", "V0", "V24"),
+            levels = c("V0", "V24")
+          )
+        )
+
+      # Y-axis annotation position
+      y_max   <- max(plot_data$log10_conc, na.rm = TRUE)
+      y_min   <- min(plot_data$log10_conc, na.rm = TRUE)
+      y_range <- y_max - y_min
+      annot_y <- y_max + y_range * 0.12
+      text_y  <- y_max + y_range * 0.25
+
+      p <- ggplot(plot_data, aes(x = Visit_label, y = log10_conc)) +
+        geom_boxplot(
+          outlier.shape = NA,
+          alpha         = 0.5,
+          width         = 0.5,
+          fill          = "white"
+        ) +
+        geom_line(
+          aes(group = Subject_ID),
+          color     = "grey60",
+          linewidth = 0.3,
+          alpha     = 0.6
+        ) +
+        geom_point(
+          aes(group = Subject_ID),
+          size  = 2,
+          alpha = 0.8,
+          color = "black"
+        ) +
+        annotate(
+          "segment",
+          x = 1, xend = 2,
+          y = annot_y, yend = annot_y,
+          color = "black"
+        ) +
+        annotate(
+          "text",
+          x        = 1.5,
+          y        = text_y,
+          label = sprintf("Median FC = %.2f", median_fc),
+          size     = 3.5,
+          fontface = "bold",
+          color = "black"
+        ) +
+        scale_y_continuous(
+          expand = expansion(mult = c(0.05, 0.35))
+        ) +
+        labs(
+          title    = paste0(cyt, " | MoSAR"),
+          subtitle = sprintf("n = %d paired patients", nrow(paired_data)),
+          x        = "Visit",
+          y        = "Concentration (log10 pg/mL)"
+        ) +
+        theme_bw() +
+        theme(
+          panel.background = element_rect(fill = "white"),
+          panel.border     = element_rect(color = "black", fill = NA),
+          axis.text        = element_text(color = "black"),
+          axis.title       = element_text(color = "black"),
+          plot.subtitle    = element_text(size = 9, color = "grey40"),
+          legend.position  = "none"
+        )
+
+      print(p)
+
+      # Print summary
+      cat(sprintf("\n%s\n", cyt))
+      cat(sprintf("  Pairs                    : %d\n",   nrow(paired_data)))
+      cat(sprintf("  Median log10 V0          : %.3f\n", median(paired_data$value_v0,   na.rm = TRUE)))
+      cat(sprintf("  Median log10 V24         : %.3f\n", median(paired_data$value_v24,  na.rm = TRUE)))
+      cat(sprintf("  Median log10 FC          : %.3f\n", median_log10_fc))
+      cat(sprintf("  Median Fold Change       : %.3f\n", median_fc))
+      cat(sprintf("  Increased (FC > 1)       : %.1f%%\n", 100 * mean(paired_data$fold_change > 1)))
+      cat(sprintf("  Decreased (FC < 1)       : %.1f%%\n", 100 * mean(paired_data$fold_change < 1)))
+
+      # Save plot
+      if (!is.null(save_path)) {
+        ggsave(
+          filename = file.path(save_path, paste0(cyt, "_paired_V0_V24.png")),
+          plot     = p,
+          width    = plot_width,
+          height   = plot_height,
+          dpi      = 300
+        )
+      }
+
+      results[[cyt]] <- data.frame(
+        cytokine        = cyt,
+        n_pairs         = nrow(paired_data),
+        median_log10_v0 = median(paired_data$value_v0,   na.rm = TRUE),
+        median_log10_v24= median(paired_data$value_v24,  na.rm = TRUE),
+        median_log10_fc = median_log10_fc,
+        median_fc       = median_fc,
+        pct_increased   = 100 * mean(paired_data$fold_change > 1),
+        pct_decreased   = 100 * mean(paired_data$fold_change < 1)
+      )
+
+    }, error = function(e) {
+      message(sprintf("Error processing %s: %s", cyt, e$message))
+    })
+  }
+
+  bind_rows(results)
+}
+```
+
+# Run paired analysis
+
+```{r}
+#| label: run-analysis
+#| fig-width: 3.5
+#| fig-height: 5
+#| message: true
+#| warning: false
+
+results_df <- analyze_cytokines_paired(
+  data         = protein_data_log,
+  cytokine_cols = cytokine_cols,
+  visit_0      = 0,
+  visit_24     = 24,
+  save_path    = output_main,
+  plot_width   = 3.5,
+  plot_height  = 5
+)
+
+cat(sprintf("\nTotal cytokines analysed: %d\n", nrow(results_df)))
+```
+
+# Save summary results
+
+```{r}
+#| label: save-results
+
+results_df <- results_df %>%
+  arrange(desc(abs(median_log10_fc)))   # rank by magnitude of fold change
+
+write_xlsx(
+  results_df,
+  path = file.path(output_main, "Figure_S5A_fold_change_results.xlsx")
+)
+
+cat("Top 10 cytokines by fold change magnitude:\n")
+print(head(results_df, 10))
+cat("\nResults saved to:", output_main, "\n")
+```
+
+# AUC-ROC of the dramatically changed biomarkers
+
+```{r}
+#| label: AUC-ROC
+#| fig-width: 8
+#| fig-height: 10
+#| message: true
+#| warning: false
+# Define stimulus-cytokine combinations for ROC testings
+cytokine_names <- c("Null_IL_18", "Null_IL_1RA", "Null_CCL3", "LPS_CCL2", "LPS_IFNG", "Null_IFNG", "LPS_IL_1RA")
+
+# Function to create ROC analysis for biomarkers
+create_roc <- function(data, cytokine) {
+  tryCatch({
+
+    if (!cytokine %in% names(data)) {
+      message("Column ", cytokine, " not found in data")
+      return(NULL)
+    }
+
+    valid_data <- data %>%
+      filter(!is.na(.data[[cytokine]]))
+    
+# Visit 0 = pre-treatment, Visit 24 = post-treatment
+    roc_obj <- roc(valid_data$Visit, valid_data[[cytokine]],
+                   levels    = c(0, 24),    
+                   direction = "auto")         
+
+    return(list(
+      roc = roc_obj,
+      auc = auc(roc_obj)
+    ))
+
+  }, error = function(e) {
+    message("Error creating ROC for ", cytokine, ": ", e$message)
+    return(NULL)
+  })
+}
+
+# Create ROC objects for each cytokine
+roc_list <- list()
+for (cytokine in cytokine_names) {
+  roc_result <- create_roc(protein_data_log, cytokine)
+  if (!is.null(roc_result)) {
+    roc_list[[cytokine]] <- roc_result
+  }
+}
+
+if (length(roc_list) == 0) {
+  stop("No valid ROC objects could be created. Check your data and cytokine names.")
+}
+cat("Created", length(roc_list), "ROC curves\n")
+
+# Compute AUC + 95% CI per cytokine
+auc_df <- imap_dfr(roc_list, function(roc_result, cyt) {
+
+  ci_vals <- ci.auc(roc_result$roc) 
+  auc_val <- as.numeric(roc_result$auc)
+  ci_low  <- as.numeric(ci_vals[1])
+  ci_high <- as.numeric(ci_vals[3])
+
+  data.frame(
+    cytokine = cyt,
+    auc      = auc_val,
+    ci_low   = ci_low,
+    ci_high  = ci_high,
+    label    = sprintf("%s (AUC = %.2f, 95%% CI: %.2f-%.2f)",
+                       cyt, auc_val, ci_low, ci_high)
+  )
+})
+
+cat("\nAUC Summary:\n")
+print(auc_df[, c("cytokine", "auc", "ci_low", "ci_high")])
+
+# Build ROC curve
+roc_df <- bind_rows(
+  lapply(names(roc_list), function(cyt) {
+
+    roc_result <- roc_list[[cyt]]
+
+    data.frame(
+      one_minus_spec = 1 - roc_result$roc$specificities,
+      sensitivity    = roc_result$roc$sensitivities,
+      cytokine       = cyt
+    ) %>%
+      arrange(one_minus_spec, sensitivity)   
+  })
+) %>%
+  left_join(auc_df %>% select(cytokine, label),
+            by = "cytokine") %>%
+  mutate(label = factor(label, levels = auc_df$label))      
+
+colors <- c("red", "magenta", "#CC6600", "#009966", "blue", "#9933FF", "black")
+
+color_map <- setNames(
+  colors[seq_along(auc_df$cytokine)],
+  auc_df$label
+)
+
+p_roc <- ggplot(roc_df,
+                aes(x     = one_minus_spec,
+                    y     = sensitivity,
+                    color = label)) +
+
+  # Reference diagonal
+  geom_abline(slope     = 1,
+              intercept = 0,
+              linetype  = "dashed",
+              color     = "grey60",
+              linewidth = 0.6) +
+
+  # ROC curves
+  geom_step(linewidth = 1.1,
+            alpha     = 0.9,
+            direction = "hv") +      
+
+  scale_color_manual(values = color_map) +
+  scale_x_continuous(limits = c(0, 1),
+                     expand = c(0.01, 0.01),
+                     breaks = seq(0, 1, 0.2)) +
+  scale_y_continuous(limits = c(0, 1),
+                     expand = c(0.01, 0.01),
+                     breaks = seq(0, 1, 0.2)) +
+
+  labs(
+    title = "ROC Curves: Visit 0 vs Visit 24 (MoSAR)",  
+    x     = "1 - Specificity",
+    y     = "Sensitivity",
+    color = NULL                                        
+  ) +
+
+  theme_bw(base_size = 12) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 13),
+    legend.position  = "bottom",
+    legend.text      = element_text(size = 8),
+    panel.grid.minor = element_blank(),
+    axis.text        = element_text(color = "black")
+  ) +
+  guides(color = guide_legend(ncol = 2))
+
+p_roc
+
+ggsave(
+  filename = file.path(output_main, "MoSAR_Treatment_TB_ROC_curves.png"),
+  plot     = p_roc,
+  width    = 6,
+  height   = 8,
+  dpi      = 300
+)
+
+cat("ROC plot saved to:", output_main, "\n")
+cat("\nAUC Values (95% CI):\n")
+cat(strrep("-", 55), "\n")
+for (i in seq_len(nrow(auc_df))) {
+  cat(sprintf("%-20s AUC = %.3f (95%% CI: %.3f-%.3f)\n",
+              auc_df$cytokine[i],
+              auc_df$auc[i],
+              auc_df$ci_low[i],
+              auc_df$ci_high[i]))
+}
+```
+
+# Session information
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

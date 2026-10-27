@@ -1,0 +1,579 @@
+---
+title: "Figure S10"
+subtitle: "PCA and volcano plots for NanoString gene expression in response to successful treatment"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# Introduction
+
+Figure S10A: PCA for NanoString gene expression under different stimulation
+conditions (Null, Mtb_Ag, LPS, IL1B) at W0 and W16 in the treatment success
+group.
+
+Figure S10B: Volcano plots for differentially expressed NanoString genes
+(paired Wilcoxon test, FDR-adjusted) between W0 and W16 under each stimulation
+condition. Log2 fold change is computed as median(W16) − median(W0) on
+log2-normalised data.
+
+# Load packages
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggrepel)
+library(FactoMineR)
+library(factoextra)
+library(writexl)
+```
+
+# Define file paths
+
+```{r}
+#| label: file-paths
+
+input_nano      <- "Input/Nanostring_Wide_log2_normalised.xlsx"
+output_main     <- "Output/Figure_S10"
+output_pca      <- file.path(output_main, "PCA")
+output_volcano  <- file.path(output_main, "Volcano")
+output_wilcoxon <- file.path(output_main, "Wilcoxon")
+
+for (d in c(output_main, output_pca, output_volcano, output_wilcoxon)) {
+  dir.create(d, recursive = TRUE, showWarnings = FALSE)
+}
+```
+
+# Load data
+
+```{r}
+#| label: load-data
+
+all_data <- read_excel(input_nano, sheet = 1) %>%
+  filter(Comments == "success") %>%
+  mutate(
+    Stimulation = ifelse(Stimulation == "TB",   "Mtb_Ag", Stimulation),
+    Stimulation = ifelse(Stimulation == "NULL", "Null",   Stimulation),
+    Visit       = paste0("W", Visit),
+    Stimulation = factor(Stimulation, levels = c("Null", "Mtb_Ag", "LPS", "IL1B"))
+  ) %>%
+  filter(!Barcode %in% "0408230288") %>%
+  select(-Barcode)
+
+# Show first 8 columns only to avoid wide output
+head(all_data[, 1:8])
+dim(all_data)
+```
+
+# Define metadata and gene columns
+
+```{r}
+#| label: define-columns
+id_col    <- "Donor"
+
+meta_cols <- c(id_col, "Visit", "Stimulation")
+gene_cols <- all_data %>%
+  select(ACE:TBP) %>%
+  names()
+
+cat(sprintf("Metadata columns : %s\n", paste(meta_cols, collapse = ", ")))
+cat(sprintf("Gene columns     : %d\n", length(gene_cols)))
+cat(sprintf("First 5 genes    : %s\n", paste(head(gene_cols, 5), collapse = ", ")))
+```
+
+# Variance filtering
+
+```{r}
+#| label: variance-filter
+
+variance_threshold <- 0.1
+
+gene_vars   <- sapply(gene_cols, function(g) var(all_data[[g]], na.rm = TRUE))
+valid_genes <- gene_cols[!is.na(gene_vars) & gene_vars > variance_threshold]
+
+cat(sprintf(
+  "Genes with NA variance (all values missing): %d\n",
+  sum(is.na(gene_vars))
+))
+cat(sprintf(
+  "Genes with zero/low variance (< %.2f): %d\n",
+  variance_threshold,
+  sum(!is.na(gene_vars) & gene_vars <= variance_threshold)
+))
+cat(sprintf(
+  "Genes retained: %d / %d\n",
+  length(valid_genes), length(gene_cols)
+))
+
+selected_data <- all_data %>%
+  select(all_of(c(meta_cols, valid_genes)))
+```
+
+# PCA function
+
+```{r}
+#| label: pca-function
+
+run_pca <- function(data, visit, meta_cols) {
+
+  dat <- data %>%
+    filter(Visit == visit) %>%
+    as.data.frame()
+
+  cat(sprintf("\nPCA at %s: %d rows x %d columns\n",
+              visit, nrow(dat), ncol(dat)))
+
+  quali_idx <- which(names(dat) %in% meta_cols)
+
+  tryCatch({
+    PCA(dat, scale. = TRUE, graph = FALSE, quali.sup = quali_idx)
+  }, error = function(e) {
+    message(sprintf("PCA failed at %s: %s", visit, e$message))
+    NULL
+  })
+}
+```
+
+# Run PCA for both visits
+
+```{r}
+#| label: run-pca
+#| message: false
+#| warning: false
+
+dat_w0 <- selected_data %>%
+  filter(Visit == "W0") %>%
+  as.data.frame()
+
+dat_w16 <- selected_data %>%
+  filter(Visit == "W16") %>%
+  as.data.frame()
+
+pca_w0  <- run_pca(selected_data, visit = "W0",  meta_cols = meta_cols)
+pca_w16 <- run_pca(selected_data, visit = "W16", meta_cols = meta_cols)
+
+cat("Variance explained W0:\n")
+print(round(get_eig(pca_w0)[1:4, ], 2))
+
+cat("Variance explained W16:\n")
+print(round(get_eig(pca_w16)[1:4, ], 2))
+```
+# Print and save PCA at W0
+
+```{r}
+#| label: scree-w0
+#| fig-show: hold
+
+if (!is.null(pca_w0)) {
+
+  scree_w0 <- fviz_screeplot(pca_w0, addlabels = TRUE) +
+    labs(title = "Scree plot — NanoString W0") +
+    theme_minimal() +
+    theme(
+      plot.background  = element_rect(fill = "white"),
+      panel.background = element_rect(fill = "white"),
+      axis.text        = element_text(color = "black"),
+      axis.title       = element_text(color = "black")
+    )
+
+  png_path <- file.path(output_pca, "S10A_scree_W0.png")
+  png(png_path, width = 6, height = 4, units = "in", res = 300)
+  print(scree_w0)
+  dev.off()
+
+  cat("Scree W0 saved.\n")
+}
+
+knitr::include_graphics(file.path(output_pca, "S10A_scree_W0.png"))
+```
+
+```{r}
+#| label: biplot-w0
+#| fig-show: hold
+if (!is.null(pca_w0)) {
+
+  biplot_w0 <- fviz_pca_biplot(
+    pca_w0,
+    axes        = c(1, 2),
+    habillage   = dat_w0$Stimulation,
+    addEllipses = FALSE,
+    invisible   = "quali",
+    label       = "var",
+    select.var  = list(cos2 = 0.9),
+    point_size  = 2,
+    repel       = TRUE,
+    ggtheme     = theme_minimal()
+  ) +
+    ggtitle("PCA — NanoString W0 (log2)") +
+    theme(
+      plot.background  = element_rect(fill = "white"),
+      panel.background = element_rect(fill = "white"),
+      axis.text        = element_text(color = "black"),
+      axis.title       = element_text(color = "black")
+    )
+
+  png_path <- file.path(output_pca, "S10A_biplot_W0.png")
+  png(png_path, width = 8, height = 6, units = "in", res = 300)
+  print(biplot_w0)
+  dev.off()
+
+  cat("Biplot W0 saved.\n")
+}
+
+knitr::include_graphics(file.path(output_pca, "S10A_biplot_W0.png"))
+```
+
+# Print and save PCA at W16
+
+```{r}
+#| label: scree-w16
+#| fig-show: hold
+
+if (!is.null(pca_w16)) {
+
+  scree_w16 <- fviz_screeplot(pca_w16, addlabels = TRUE) +
+    labs(title = "Scree plot — NanoString W16") +
+    theme_minimal() +
+    theme(
+      plot.background  = element_rect(fill = "white"),
+      panel.background = element_rect(fill = "white"),
+      axis.text        = element_text(color = "black"),
+      axis.title       = element_text(color = "black")
+    )
+
+  png_path <- file.path(output_pca, "S10A_scree_W16.png")
+  png(png_path, width = 6, height = 4, units = "in", res = 300)
+  print(scree_w16)
+  dev.off()
+
+  cat("Scree W16 saved.\n")
+}
+
+knitr::include_graphics(file.path(output_pca, "S10A_scree_W16.png"))
+
+```
+
+```{r}
+#| label: biplot-w16
+#| fig-show: hold
+
+if (!is.null(pca_w16)) {
+
+  biplot_w16 <- fviz_pca_biplot(
+    pca_w16,
+    axes        = c(1, 2),
+    habillage   = dat_w16$Stimulation,
+    addEllipses = FALSE,
+    invisible   = "quali",
+    label       = "var",
+    select.var  = list(cos2 = 0.9),
+    point_size  = 2,
+    repel       = TRUE,
+    ggtheme     = theme_minimal()
+  ) +
+    ggtitle("PCA — NanoString W16 (log2)") +
+    theme(
+      plot.background  = element_rect(fill = "white"),
+      panel.background = element_rect(fill = "white"),
+      axis.text        = element_text(color = "black"),
+      axis.title       = element_text(color = "black")
+    )
+
+  png_path <- file.path(output_pca, "S10A_biplot_W16.png")
+  png(png_path, width = 8, height = 6, units = "in", res = 300)
+  print(biplot_w16)
+  dev.off()
+  
+  cat("Biplot W16 saved.\n")
+}
+
+knitr::include_graphics(file.path(output_pca, "S10A_biplot_W16.png"))
+```
+
+# Paired Wilcoxon function
+
+```{r}
+#| label: wilcoxon-function
+#| message: true
+
+compare_w0_w16 <- function(data, condition, id_col, gene_cols,
+                            w0_code = "W0", w16_code = "W16") {
+
+  dat <- data %>% filter(Stimulation == condition)
+
+  # Check for duplicates
+  dup_check  <- table(paste(dat[[id_col]], dat$Visit, sep = "_"))
+  duplicates <- names(dup_check[dup_check > 1])
+  if (length(duplicates) > 0) {
+    message(sprintf(
+      "WARNING [%s]: duplicate ID-Visit combinations found: %s",
+      condition, paste(duplicates, collapse = ", ")
+    ))
+  }
+
+  patients_w0   <- unique(dat[[id_col]][dat$Visit == w0_code])
+  patients_w16  <- unique(dat[[id_col]][dat$Visit == w16_code])
+  patients_both <- intersect(patients_w0, patients_w16)
+
+  cat(sprintf("\n[%s] Participants with both %s and %s: %d\n",
+              condition, w0_code, w16_code, length(patients_both)))
+
+  if (length(patients_both) == 0) {
+    message(sprintf("[%s] No paired participants found — skipping.", condition))
+    return(data.frame())
+  }
+
+  result_list <- lapply(gene_cols, function(gene) {
+
+    w0_vals  <- c()
+    w16_vals <- c()
+
+    for (pid in patients_both) {
+      r0  <- which(dat[[id_col]] == pid & dat$Visit == w0_code)[1]
+      r16 <- which(dat[[id_col]] == pid & dat$Visit == w16_code)[1]
+
+      if (!is.na(r0) && !is.na(r16)) {
+        v0  <- suppressWarnings(as.numeric(as.character(dat[r0,  gene])))
+        v16 <- suppressWarnings(as.numeric(as.character(dat[r16, gene])))
+        if (!is.na(v0) && !is.na(v16)) {
+          w0_vals  <- c(w0_vals,  v0)
+          w16_vals <- c(w16_vals, v16)
+        }
+      }
+    }
+
+    if (length(w0_vals) < 5) return(NULL)
+
+    diffs <- w16_vals - w0_vals
+    if (var(diffs) == 0) return(NULL)
+
+    tryCatch({
+      test   <- wilcox.test(w0_vals, w16_vals, paired = TRUE, exact = FALSE)
+      log2fc <- median(w16_vals) - median(w0_vals)
+
+      data.frame(
+        analyte          = gene,
+        p_value          = test$p.value,
+        p_adjusted       = NA_real_,
+        median_W0        = median(w0_vals),
+        median_W16       = median(w16_vals),
+        log2_fold_change = log2fc,
+        fold_change      = 2^log2fc,
+        n_pairs          = length(w0_vals)
+      )
+    }, error = function(e) {
+      message(sprintf("Wilcoxon error [%s | %s]: %s", condition, gene, e$message))
+      NULL
+    })
+  })
+
+  results <- bind_rows(result_list)
+
+  if (nrow(results) == 0) {
+    message(sprintf("[%s] No genes returned results.", condition))
+    return(results)
+  }
+
+  # FDR adjustment using Benjamini-Hochberg
+  results <- results %>%
+    mutate(
+      p_adjusted   = p.adjust(p_value, method = "BH"),
+      significance = case_when(
+        p_adjusted < 0.001 ~ "***",
+        p_adjusted < 0.01  ~ "**",
+        p_adjusted < 0.05  ~ "*",
+        TRUE               ~ ""
+      )
+    ) %>%
+    arrange(p_adjusted)
+
+  cat(sprintf("[%s] Genes tested: %d | Significant (FDR < 0.05): %d\n",
+              condition,
+              nrow(results),
+              sum(results$p_adjusted < 0.05, na.rm = TRUE)))
+
+  results
+}
+```
+
+# Volcano plot function
+
+```{r}
+#| label: volcano-function
+
+create_volcano_plot <- function(results_df, reference_group, comparison_group,
+                                 log2fc_threshold = 1,
+                                 p_threshold      = 0.05,
+                                 max_labels       = 200) {
+
+  volcano_data <- results_df %>%
+    mutate(
+      log10p       = -log10(p_adjusted),
+      significance = case_when(
+        is.na(p_adjusted)                                 ~ "Not Tested",
+        p_adjusted >= p_threshold                         ~ "Not Significant",
+        p_adjusted <  p_threshold & log2_fold_change > 0 ~ "Positive",
+        p_adjusted <  p_threshold & log2_fold_change < 0 ~ "Negative"
+      ),
+      significance = factor(significance,
+                            levels = c("Positive", "Negative",
+                                       "Not Significant", "Not Tested")),
+      to_label     = !is.na(p_adjusted) &
+        p_adjusted < p_threshold &
+        abs(log2_fold_change) > log2fc_threshold
+    )
+
+  label_analytes <- volcano_data %>%
+    filter(to_label) %>%
+    arrange(desc(abs(log2_fold_change) * log10p)) %>%
+    head(max_labels) %>%
+    pull(analyte)
+
+  volcano_data <- volcano_data %>%
+    mutate(label = ifelse(analyte %in% label_analytes, analyte, ""))
+
+  ggplot(volcano_data,
+         aes(x = log2_fold_change, y = log10p, color = significance)) +
+    geom_point(alpha = 0.7, size = 1) +
+    geom_hline(
+      yintercept = -log10(p_threshold),
+      linetype = "dashed", color = "gray50"
+    ) +
+    geom_vline(
+      xintercept = c(-log2fc_threshold, log2fc_threshold),
+      linetype = "dashed", color = "gray50"
+    ) +
+    geom_text_repel(
+      aes(label = label),
+      max.overlaps  = 40,
+      box.padding   = 0.5,
+      segment.color = "gray50",
+      force         = 3,
+      size          = 3
+    ) +
+    scale_color_manual(
+      values = c(
+        "Positive"        = "red",
+        "Negative"        = "blue",
+        "Not Significant" = "gray70",
+        "Not Tested"      = "gray70"
+      ),
+      breaks = c("Positive", "Negative", "Not Significant", "Not Tested")
+    ) +
+    labs(
+      title    = paste0(reference_group, " vs ", comparison_group),
+      subtitle = paste0(
+        "Positive: higher in ", comparison_group,
+        " | Negative: higher in ", reference_group
+      ),
+      x     = "Log2 Fold Change (W16 / W0)",
+      y     = "-Log10 FDR-adjusted p-value",
+      color = "Significance"
+    ) +
+    theme_bw() +
+    theme(
+      plot.title       = element_text(size = 14, face = "bold"),
+      axis.text        = element_text(color = "black"),
+      axis.title       = element_text(color = "black"),
+      legend.position  = "right",
+      panel.grid.minor = element_blank()
+    ) +
+    guides(color = guide_legend(
+      override.aes = list(shape = 16, size = 4, alpha = 1)
+    ))
+}
+```
+
+# Figure S10B — Wilcoxon tests and volcano plots for all conditions
+
+```{r}
+#| label: run-wilcoxon-volcano
+#| fig-width: 10
+#| fig-height: 8
+#| message: true
+#| warning: false
+
+conditions  <- c("Null", "Mtb_Ag", "LPS", "IL1B")
+all_results <- list()
+
+for (cond in conditions) {
+
+  results <- compare_w0_w16(
+    data      = selected_data,
+    condition = cond,
+    id_col    = id_col,          # defined in define-columns chunk
+    gene_cols = valid_genes
+  )
+
+  all_results[[cond]] <- results
+
+  if (nrow(results) == 0) {
+    cat(sprintf("[%s] No results — skipping plot.\n", cond))
+    next
+  }
+
+  # Save per-condition results
+  write_xlsx(
+    results,
+    path = file.path(output_wilcoxon,
+                     paste0("S10B_", cond, "_W0_W16_wilcoxon.xlsx"))
+  )
+
+  # Create volcano plot
+  volcano <- create_volcano_plot(
+    results_df       = results,
+    reference_group  = paste0(cond, "_W0"),
+    comparison_group = paste0(cond, "_W16"),
+    log2fc_threshold = 1,
+    p_threshold      = 0.05,
+    max_labels       = 200
+  )
+
+  print(volcano)
+
+  ggsave(
+    file.path(output_volcano,
+              paste0("S10B_", cond, "_W0_W16_volcano.png")),
+    plot   = volcano,
+    width  = 10,
+    height = 8,
+    dpi    = 300
+  )
+}
+
+# Save all conditions in one workbook — one sheet per condition
+write_xlsx(
+  all_results,
+  path = file.path(output_wilcoxon, "S10B_all_conditions_wilcoxon_results.xlsx")
+)
+
+cat("\nAll outputs saved to:", output_main, "\n")
+```
+
+# Session information
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

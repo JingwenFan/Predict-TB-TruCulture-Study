@@ -1,0 +1,486 @@
+---
+title: "QC for protein measurements"
+subtitle: "Detectability of protein measurements (Figure S2); Data cleaning and transformation; Normality (Shapiro-Wilk) test"
+format:
+  html:
+    toc: true
+    toc-location: left
+    number-sections: true
+    embed-resources: true
+    theme: cosmo
+    reference-location: margin
+    citation-location: margin
+    grid:
+      sidebar-width: 300px
+      body-width: 900px
+      margin-width: 300px
+editor: source
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+# QC test for protein analysis
+
+This Quarto document loads protein data from Luminex and Simoa measurements, checks for detectability (Figure S2), processes the data for subsequent analysis, and tests normality (Shapiro-Wilk)
+
+# Load packages
+
+```{r setup}
+#| message: false
+#| warning: false
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(DataExplorer)
+library(writexl)
+```
+
+# Define paths
+
+```{r paths}
+input_file    <- "Input/Cytokines_Predict-TB.xlsx"
+output_fig_s2 <- "Output/Figure_S2"
+output_tables <- "Output/Figure_S2/Tables"
+
+dir.create(output_fig_s2, recursive = TRUE, showWarnings = FALSE)
+dir.create(output_tables, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Load Data
+
+```{r}
+all_data <- read_excel(input_file, sheet = 1)
+
+head(all_data)
+dim(all_data)
+```
+
+# Rename Variables
+```{r}
+# Column names are updated to use standard cytokine nomenclature
+names(all_data)
+
+protein_data <- all_data %>%
+  rename(
+    BDNF       = L_BDNF,
+    CCL11      = L_Eotaxin_1,
+    Factor_VII = L_Factor_VII,
+    ICAM_1     = L_ICAM_1,
+    IL_1_alpha = L_IL_1_alpha,
+    IL_1_beta  = L_IL_1_beta,
+    IL_10      = L_IL_10,
+    IL_12p40   = L_IL_12p40,
+    IL_12p70   = L_IL_12p70,
+    IL_18      = L_IL_18,
+    IL_1RA     = L_IL_1ra,
+    IL_3       = L_IL_3,
+    IL_4       = L_IL_4,
+    IL_6       = L_IL_6,
+    IL_7       = L_IL_7,
+    IL_8       = L_IL_8,
+    CCL2       = L_MCP_1,
+    CCL3       = L_MIP_1_alpha,
+    MMP_3      = L_MMP_3,
+    TNF        = L_TNF_alpha,
+    VEGF       = L_VEGF,
+    IFNG_S     = S_IFN_gamma,
+    IL_2_S     = S_IL_2,
+    IFNG_L     = L_IFN_gamma,
+    IL_2_L     = L_IL_2,
+    GM_CSF     = L_GM_CSF,
+    IL_17      = L_IL_17,
+    IL_5       = L_IL_5,
+    MMP_9      = L_MMP_9,
+    SCF        = L_SCF,
+    TNF_beta   = L_TNF_beta,
+    pan_IFNA   = `Pan-IFNa (fg/mL)`,
+    IFNB       = `IFNb (pg/mL)`
+  )
+
+names(protein_data)
+```
+
+# -- Detectability Analysis --
+
+```{r}
+# Extract LOD
+
+lod_values <- protein_data %>%
+  filter(Condition == "LOD") %>%
+  select(BDNF:IFNB)
+
+data_clean <- protein_data %>%
+  filter(Condition != "LOD")
+```
+
+# Reshape to Long Format
+```{r}
+# Reshape-long
+
+data_long <- data_clean %>%
+  select(ID1, Condition, Visit, BDNF:IFNB) %>%
+  pivot_longer(
+    cols      = BDNF:IFNB,
+    names_to  = "Cytokine",
+    values_to = "Value"
+  )
+
+lod_long <- lod_values %>%
+  pivot_longer(
+    cols      = everything(),
+    names_to  = "Cytokine",
+    values_to = "LOD"
+  )
+```
+
+# Calculate Detectability
+
+```{r}
+detectability <- data_long %>%
+  left_join(lod_long, by = "Cytokine") %>%
+  group_by(Condition, Cytokine) %>%
+  summarise(
+    N_total       = sum(!is.na(Value)),
+    N_detected    = sum(Value > LOD, na.rm = TRUE),
+    Detectability = round(N_detected / N_total * 100, 1),
+    .groups = "drop"
+  )
+
+detectability
+```
+
+# Save Detectability Results
+
+The detectability table is saved as an Excel file for downstream use.
+
+```{r}
+# Save detectability
+
+write_xlsx(
+  detectability,
+  path = file.path(output_tables, "Detectability_all_cytokines.xlsx")
+)
+```
+
+# -- Figure S2: Detectability Heatmap --
+
+```{r}
+# Order conditions
+
+detectability <- detectability %>%
+  mutate(
+    Condition = factor(
+      Condition,
+      levels = c("Null", "Mtb_Ag", "LPS", "IL1B")
+    )
+  )
+```
+
+# Build the Heatmap
+
+```{r}
+# Heatmap-detectability
+heatmap_detect <- ggplot(
+    detectability,
+    aes(x = Condition, y = Cytokine, fill = Detectability)
+  ) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(
+    aes(label = paste0(Detectability, "%")),
+    color = "black",
+    size  = 3
+  ) +
+  scale_fill_gradient2(
+    low      = "#2166ac",
+    mid      = "white",
+    high     = "#b2182b",
+    midpoint = 50,
+    limits   = c(0, 100),
+    name     = "Detectability (%)"
+  ) +
+  labs(
+    title    = "Cytokine detectability by stimulation condition",
+    subtitle = "Percentage of samples with values above the limit of detection",
+    x        = "Stimulation condition",
+    y        = "Cytokine"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, color = "black"),
+    axis.text.y     = element_text(color = "black"),
+    plot.title      = element_text(face = "bold", size = 14, color = "black"),
+    plot.subtitle   = element_text(color = "black"),
+    legend.position = "right",
+    panel.grid      = element_blank()
+  )
+
+heatmap_detect
+```
+
+# Save the Heatmap
+
+```{r}
+# Save heatmap
+
+ggsave(
+  filename = file.path(output_fig_s2, "S2_Heatmap_detectability_all_cytokines.pdf"),
+  plot     = heatmap_detect,
+  width    = 8,
+  height   = 8,
+  units    = "in"
+)
+```
+
+# -- Data cleaning and transformation --
+
+```{r remove-low-detectability}
+# Remove cytokines with low detectability. 
+# Proteins with less than 50% detectability in all stimulation conditions were considered not consistently detectable and will be excluded from subsequent analyses. For IFNG and IL-2, Simoa measurements replaced Luminex in subsequent analyses due to superior detectability.
+
+columns_to_remove <- c(
+  "GM_CSF",
+  "IL_17",
+  "IL_5",
+  "MMP_9",
+  "SCF",
+  "TNF_beta",
+  "IL_2_L",
+  "IFNG_L"
+)
+
+protein_data_filtered <- data_clean %>%
+  select(-any_of(columns_to_remove))
+
+names(protein_data_filtered)
+```
+
+# Rename cytokines with correct nomenclature
+
+```{r rename-cytokines}
+protein_data_new <- protein_data_filtered %>%
+  rename(
+    IFNG       = IFNG_S,
+    IL_2       = IL_2_S
+  )
+
+names(protein_data_new)
+```
+
+# Define cytokine column names
+
+```{r cytokine-cols}
+# Defined cytokine columns
+cytokine_cols <- c(
+  "BDNF", "CCL11", "Factor_VII", "ICAM_1",
+  "IL_1_alpha", "IL_1_beta", "IL_10", "IL_12p40",
+  "IL_12p70", "IL_18", "IL_1RA", "IL_3", "IL_4",
+  "IL_6", "IL_7", "IL_8", "CCL2", "CCL3",
+  "MMP_3", "TNF", "VEGF", "IFNG", "IL_2",
+  "pan_IFNA", "IFNB"
+)
+
+```
+
+# Initial data overview
+
+```{r intro-before-imputation}
+plot_intro(protein_data_new[, cytokine_cols])
+```
+
+# Impute missing values for Simoa assay, by median values from the same Condition-Visit combination
+
+```{r impute-function}
+# cytokine_cols passed as argument to avoids a hardcoded list inside function
+impute_by_groups <- function(data, cols) {
+  data %>%
+    group_by(Condition, Visit) %>%
+    mutate(
+      across(
+        all_of(cols),
+        ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)
+      )
+    ) %>%
+    ungroup()
+}
+```
+
+```{r apply-imputation}
+protein_data_new <- impute_by_groups(protein_data_new, cytokine_cols)
+
+cat("Total NAs remaining:", sum(is.na(protein_data_new[, cytokine_cols])), "\n")
+```
+
+# Data overview after imputation
+
+```{r intro-after-imputation}
+plot_intro(protein_data_new[, cytokine_cols])
+```
+# Check for zeros or negative values
+
+```{r check-values}
+n_zeros     <- sum(protein_data_new[, cytokine_cols] == 0, na.rm = TRUE)
+n_negatives <- sum(protein_data_new[, cytokine_cols] <  0, na.rm = TRUE)
+
+cat(sprintf("Zeros: %d | Negatives: %d\n", n_zeros, n_negatives))
+```
+# Log10 transform cytokine values
+
+```{r log-transform}
+# Due to very small and positive Simoa values, use log10 transformation, instead of log10(1+a)
+
+protein_data_log <- protein_data_new %>%
+  mutate(across(all_of(cytokine_cols), ~ log10(.x)))
+
+head(protein_data_log)
+```
+
+# Save curated data frame for subsequent analysis
+```{r}
+write_xlsx(
+  protein_data_log,
+  path = file.path(output_tables, "Cytokines_cleaned_log10_Predict-TB.xlsx")
+)
+```
+
+# -- Normality Test (Shapiro-Wilk) --
+
+The Shapiro-Wilk test is applied to baseline samples (W0). The test is run
+separately for each condition and cytokine combination.
+
+# Filter to W0
+
+```{r}
+# Filter W0
+
+data_visit0 <- data_long %>%
+  filter(Visit == 0)
+
+cat("Number of rows after filtering to W0:", nrow(data_visit0), "\n")
+cat("Conditions present:", paste(unique(data_visit0$Condition), collapse = ", "), "\n")
+```
+
+# Remove Low-Variance Cytokines
+
+```{r}
+
+variance_per_cytokine <- data_visit0 %>%
+  group_by(Cytokine) %>%
+  summarise(
+    Variance = var(Value, na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+low_variance_cytokines <- variance_per_cytokine %>%
+  filter(Variance < 0.01) %>%
+  pull(Cytokine)
+
+cat(
+  "Cytokines removed due to low variance (< 0.01):\n",
+  paste(low_variance_cytokines, collapse = ", "), "\n"
+)
+
+data_visit0_filtered <- data_visit0 %>%
+  filter(!Cytokine %in% low_variance_cytokines)
+
+cat(
+  "\nCytokines retained for normality testing:",
+  n_distinct(data_visit0_filtered$Cytokine), "\n"
+)
+```
+
+# Shapiro-Wilk Helper Function
+
+```{r}
+# Shapiro-function
+
+run_shapiro <- function(x) {
+  vals <- na.omit(x)
+  n    <- length(vals)
+
+  if (n < 3 || n > 5000) {
+    reason <- ifelse(n < 3, "fewer than 3 observations", "more than 5000 observations")
+    return(data.frame(
+      SW_statistic = NA_real_,
+      SW_p_value   = NA_real_,
+      Note         = reason
+    ))
+  }
+
+  if (length(unique(vals)) == 1) {
+    return(data.frame(
+      SW_statistic = NA_real_,
+      SW_p_value   = NA_real_,
+      Note         = "all values are identical"
+    ))
+  }
+
+  result <- shapiro.test(vals)
+  return(data.frame(
+    SW_statistic = as.numeric(result$statistic),
+    SW_p_value   = result$p.value,
+    Note         = NA_character_
+  ))
+}
+```
+
+# Run the Normality Test
+A p-value greater than 0.05 indicates that the data are consistent with a normal distribution.
+
+```{r}
+# Normality-test
+
+normality_results <- data_visit0_filtered %>%
+  group_by(Condition, Cytokine) %>%
+  summarise(
+    N         = sum(!is.na(Value)),
+    sw_result = list(run_shapiro(Value)),
+    .groups   = "drop"
+  ) %>%
+  unnest(sw_result) %>%
+  mutate(
+    Normal = case_when(
+      is.na(SW_p_value) ~ "Not tested",
+      SW_p_value > 0.05 ~ "Yes",
+      TRUE              ~ "No"
+    )
+  )
+
+normality_results
+```
+
+# Summarise Normality Results
+
+A quick summary of how many cytokines pass or fail the normality test within
+each condition.
+
+```{r}
+# Normality-summary
+
+normality_results %>%
+  filter(Normal != "Not tested") %>%
+  count(Condition, Normal) %>%
+  tidyr::pivot_wider(
+    names_from  = Normal,
+    values_from = n,
+    values_fill = 0
+  )
+```
+
+# Save Normality Results
+
+```{r}
+# Save normality
+
+write_xlsx(
+  normality_results,
+  path = file.path(output_tables, "Normality_Shapiro_Wilk_Visit0.xlsx")
+)
+```
+
+# Session Information
+```{r}
+sessionInfo()
+```
